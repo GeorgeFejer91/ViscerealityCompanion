@@ -10,12 +10,11 @@ public static class QuestTwinStatePublisherInventoryService
     public static QuestTwinStatePublisherInventory Inspect(
         ILslStreamDiscoveryService? discoveryService,
         string? packageId,
+        string? expectedSourceIdOverride = null,
         int limit = 8)
     {
-        var expectedSourceId = string.IsNullOrWhiteSpace(packageId)
-            ? string.Empty
-            : TwinLslSourceId.BuildQuestStateSourceId(packageId, StreamName, StreamType);
-        var expectedSourceIdPrefix = TwinLslSourceId.QuestSourcePrefix;
+        var expectedSourceId = BuildExpectedSourceId(packageId, expectedSourceIdOverride);
+        var expectedSourceIdPrefix = BuildExpectedSourceIdPrefix(expectedSourceIdOverride);
 
         if (discoveryService is null)
         {
@@ -68,10 +67,12 @@ public static class QuestTwinStatePublisherInventoryService
         var exactMatch = !string.IsNullOrWhiteSpace(expectedSourceId)
             ? visiblePublishers.FirstOrDefault(stream => string.Equals(stream.SourceId, expectedSourceId, StringComparison.Ordinal))
             : null;
-        var prefixMatches = visiblePublishers
-            .Where(stream => !string.IsNullOrWhiteSpace(stream.SourceId) &&
-                             stream.SourceId.StartsWith(expectedSourceIdPrefix, StringComparison.Ordinal))
-            .ToArray();
+        var prefixMatches = string.IsNullOrWhiteSpace(expectedSourceIdPrefix)
+            ? Array.Empty<LslVisibleStreamInfo>()
+            : visiblePublishers
+                .Where(stream => !string.IsNullOrWhiteSpace(stream.SourceId) &&
+                                 stream.SourceId.StartsWith(expectedSourceIdPrefix, StringComparison.Ordinal))
+                .ToArray();
 
         if (exactMatch is not null)
         {
@@ -135,6 +136,23 @@ public static class QuestTwinStatePublisherInventoryService
             : $"visible sources {RenderStreamList(inventory.VisiblePublishers)}";
         return $"{inventory.Summary} {inventory.Detail} {visible}".Trim();
     }
+
+    public static string BuildExpectedSourceId(string? packageId, string? expectedSourceIdOverride = null)
+    {
+        if (!string.IsNullOrWhiteSpace(expectedSourceIdOverride))
+        {
+            return expectedSourceIdOverride.Trim();
+        }
+
+        return string.IsNullOrWhiteSpace(packageId)
+            ? string.Empty
+            : TwinLslSourceId.BuildQuestStateSourceId(packageId, StreamName, StreamType);
+    }
+
+    public static string BuildExpectedSourceIdPrefix(string? expectedSourceIdOverride = null)
+        => string.IsNullOrWhiteSpace(expectedSourceIdOverride)
+            ? TwinLslSourceId.QuestSourcePrefix
+            : string.Empty;
 
     private static string RenderExpectedSource(string expectedSourceId, string expectedSourceIdPrefix)
         => string.IsNullOrWhiteSpace(expectedSourceId)

@@ -43,6 +43,7 @@
     "expectedCoherenceLabel": "",
     "expectedLslStreamName": "peripersonal_runtime_state_{participantRef}",
     "expectedLslStreamType": "peripersonal.runtime.state",
+    "questTwinStateSourceId": "quest.twin.state.peripersonal",
     "recenterDistanceThresholdUnits": 0.2,
     "lslConnectivityKeys": [
       "study.recording.device.active",

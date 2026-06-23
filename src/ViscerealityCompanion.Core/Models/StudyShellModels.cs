@@ -127,7 +127,8 @@ public sealed record StudyMonitoringProfile(
     IReadOnlyList<string> PerformanceTargetFpsKeys,
     IReadOnlyList<string> PerformanceRefreshRateKeys,
     IReadOnlyList<string> RecenterDistanceKeys,
-    IReadOnlyList<string> ParticleVisibilityKeys);
+    IReadOnlyList<string> ParticleVisibilityKeys,
+    string QuestTwinStateSourceId = "");
 
 public sealed record StudyControlProfile(
     string RecenterCommandActionId,

@@ -507,7 +507,12 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
 
         if (_twinBridge is LslTwinModeBridge lslBridge)
         {
-            lslBridge.ConfigureExpectedQuestStateSource(_study.App.PackageId);
+            lslBridge.ConfigureStateSourceFilter(
+                QuestTwinStatePublisherInventoryService.BuildExpectedSourceId(
+                    _study.App.PackageId,
+                    _study.Monitoring.QuestTwinStateSourceId),
+                QuestTwinStatePublisherInventoryService.BuildExpectedSourceIdPrefix(
+                    _study.Monitoring.QuestTwinStateSourceId));
             lslBridge.StateChanged += OnTwinBridgeStateChanged;
             lslBridge.TimingMarkerReceived += OnTwinTimingMarkerReceived;
         }
@@ -2998,7 +3003,10 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
         try
         {
             inventory = await Task
-                .Run(() => QuestTwinStatePublisherInventoryService.Inspect(_lslStreamDiscoveryService, _study.App.PackageId))
+                .Run(() => QuestTwinStatePublisherInventoryService.Inspect(
+                    _lslStreamDiscoveryService,
+                    _study.App.PackageId,
+                    _study.Monitoring.QuestTwinStateSourceId))
                 .ConfigureAwait(false);
         }
         catch (Exception exception)

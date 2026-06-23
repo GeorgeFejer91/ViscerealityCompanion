@@ -103,7 +103,8 @@ public sealed class StudyShellCatalogLoader
                     CloneList(dto.Monitoring?.PerformanceTargetFpsKeys),
                     CloneList(dto.Monitoring?.PerformanceRefreshRateKeys),
                     CloneList(dto.Monitoring?.RecenterDistanceKeys),
-                    CloneList(dto.Monitoring?.ParticleVisibilityKeys)),
+                    CloneList(dto.Monitoring?.ParticleVisibilityKeys),
+                    dto.Monitoring?.QuestTwinStateSourceId?.Trim() ?? string.Empty),
                 new StudyControlProfile(
                     dto.Controls?.RecenterCommandActionId ?? string.Empty,
                     dto.Controls?.ParticleVisibleOnActionId ?? string.Empty,
@@ -396,6 +397,9 @@ public sealed class StudyShellCatalogLoader
 
         [JsonPropertyName("expectedLslStreamType")]
         public string? ExpectedLslStreamType { get; init; }
+
+        [JsonPropertyName("questTwinStateSourceId")]
+        public string? QuestTwinStateSourceId { get; init; }
 
         [JsonPropertyName("recenterDistanceThresholdUnits")]
         public double? RecenterDistanceThresholdUnits { get; init; }

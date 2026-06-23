@@ -101,7 +101,8 @@ internal static class DiagnosticsCliSupport
             {
                 var previewTwinStatePublisher = QuestTwinStatePublisherInventoryService.Inspect(
                     streamDiscovery,
-                    definition.App.PackageId);
+                    definition.App.PackageId,
+                    definition.Monitoring.QuestTwinStateSourceId);
                 var previewAssessment = SussexConnectionAssessmentService.Assess(new SussexConnectionAssessmentInput(
                     PinnedBuildReady: IsPinnedBuildReady(definition, installed),
                     DeviceProfileReady: profileStatus.IsActive,
@@ -146,12 +147,18 @@ internal static class DiagnosticsCliSupport
                     CheckedAtUtc: checkedAtUtc);
             }
 
-            lslBridge.ConfigureExpectedQuestStateSource(definition.App.PackageId);
+            lslBridge.ConfigureStateSourceFilter(
+                QuestTwinStatePublisherInventoryService.BuildExpectedSourceId(
+                    definition.App.PackageId,
+                    definition.Monitoring.QuestTwinStateSourceId),
+                QuestTwinStatePublisherInventoryService.BuildExpectedSourceIdPrefix(
+                    definition.Monitoring.QuestTwinStateSourceId));
             var openOutcome = lslBridge.Open();
             await WaitForTwinStateAsync(lslBridge, waitDuration, cancellationToken).ConfigureAwait(false);
             var twinStatePublisher = QuestTwinStatePublisherInventoryService.Inspect(
                 streamDiscovery,
-                definition.App.PackageId);
+                definition.App.PackageId,
+                definition.Monitoring.QuestTwinStateSourceId);
 
             var state = BuildStudyConnectionProbeState(definition, headset, installed, profileStatus, device, lslBridge, twinStatePublisher, expectedUpstream, wifiTransport, checkedAtUtc);
             return openOutcome.Kind == OperationOutcomeKind.Failure

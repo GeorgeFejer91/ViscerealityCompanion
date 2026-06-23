@@ -184,7 +184,12 @@ public sealed class SussexDiagnosticsReportService
 
         if (_twinBridge is LslTwinModeBridge lslBridge)
         {
-            lslBridge.ConfigureExpectedQuestStateSource(study.App.PackageId);
+            lslBridge.ConfigureStateSourceFilter(
+                QuestTwinStatePublisherInventoryService.BuildExpectedSourceId(
+                    study.App.PackageId,
+                    study.Monitoring.QuestTwinStateSourceId),
+                QuestTwinStatePublisherInventoryService.BuildExpectedSourceIdPrefix(
+                    study.Monitoring.QuestTwinStateSourceId));
             lslBridge.Open();
         }
 
@@ -222,7 +227,10 @@ public sealed class SussexDiagnosticsReportService
                 cancellationToken)
             .ConfigureAwait(false);
         var machineLslState = await BuildMachineLslStateResultAsync(study, cancellationToken).ConfigureAwait(false);
-        var twinStatePublisher = QuestTwinStatePublisherInventoryService.Inspect(_streamDiscoveryService, study.App.PackageId);
+        var twinStatePublisher = QuestTwinStatePublisherInventoryService.Inspect(
+            _streamDiscoveryService,
+            study.App.PackageId,
+            study.Monitoring.QuestTwinStateSourceId);
         var questSetup = BuildQuestSetupSnapshot(study, request.DeviceSelector, headset, installed, profileStatus);
         var twinConnection = BuildTwinConnectionProbe(study, headset, installed, profileStatus, _twinBridge, twinStatePublisher, expectedUpstream, request.DeviceSelector);
         var commandAcceptance = request.RunCommandAcceptanceCheck

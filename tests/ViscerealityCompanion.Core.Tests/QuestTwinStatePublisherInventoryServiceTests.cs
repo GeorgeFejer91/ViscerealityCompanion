@@ -64,6 +64,32 @@ public sealed class QuestTwinStatePublisherInventoryServiceTests
         Assert.Contains("companion will ignore", inventory.Detail, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public void Inspect_accepts_declared_legacy_source_id_override()
+    {
+        var discovery = new FakeLslStreamDiscoveryService(
+        [
+            new LslVisibleStreamInfo(
+                "quest_twin_state",
+                "quest.twin.state",
+                "quest.twin.state.peripersonal",
+                4,
+                0f,
+                123d)
+        ]);
+
+        var inventory = QuestTwinStatePublisherInventoryService.Inspect(
+            discovery,
+            "com.Viscereality.ViscerealityPeriPersonal",
+            "quest.twin.state.peripersonal");
+
+        Assert.Equal(OperationOutcomeKind.Success, inventory.Level);
+        Assert.True(inventory.AnyPublisherVisible);
+        Assert.True(inventory.ExpectedPublisherVisible);
+        Assert.Equal("quest.twin.state.peripersonal", inventory.ExpectedSourceId);
+        Assert.Equal(string.Empty, inventory.ExpectedSourceIdPrefix);
+    }
+
     private sealed class FakeLslStreamDiscoveryService(IReadOnlyList<LslVisibleStreamInfo> streams) : ILslStreamDiscoveryService
     {
         public LslRuntimeState RuntimeState { get; } = new(true, "Fake LSL discovery.");
