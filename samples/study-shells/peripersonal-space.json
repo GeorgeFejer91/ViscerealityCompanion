@@ -30,6 +30,7 @@
       "viscereality.panel.prepareReceiptJsonExtra": "io.github.mesmerprism.questquestionnaire.panel.extra.RECEIPT_JSON",
       "viscereality.panel.targetRuntimeKind": "quest_questionnaire_panel_apk",
       "viscereality.minimum_headset_battery_percent": "50",
+      "viscereality.required_wifi_ssid": "NFTulpa",
       "viscereality.recordingLifecycle": "one_global_recording_after_block_1",
       "viscereality.sessionFolderNaming": "participantRef_sessionId_yyyyMMdd-HHmmss",
       "viscereality.breathTrackingControllerRule": "right-handed=>left-controller; left-handed=>right-controller",

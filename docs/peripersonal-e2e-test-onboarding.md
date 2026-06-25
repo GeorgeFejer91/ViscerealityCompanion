@@ -79,6 +79,12 @@ $Bundle = "C:\path\to\peripersonal-e2e-kit-20260620"
 Use a Quest with developer mode enabled and USB debugging authorized for the
 operator machine.
 
+Golden network standard for this Peripersonal workflow: both the Windows
+operator PC and the Quest must be on Wi-Fi SSID `NFTulpa`. Do not proceed on
+`UniKonstanzOpen`, a guest/client-isolated network, or a merely reachable
+routed path; the companion's Peripersonal readiness gate expects `NFTulpa` on
+both sides.
+
 1. Connect the Quest over USB.
 
 2. Confirm USB visibility:

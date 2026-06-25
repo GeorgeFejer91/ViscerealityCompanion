@@ -24,6 +24,7 @@
     <ProjectReference Include="..\..\src\ViscerealityCompanion.App\ViscerealityCompanion.App.csproj" />
     <ProjectReference Include="..\..\src\ViscerealityCompanion.Cli\ViscerealityCompanion.Cli.csproj" />
     <ProjectReference Include="..\..\src\ViscerealityCompanion.Core\ViscerealityCompanion.Core.csproj" />
+    <ProjectReference Include="..\..\src\ViscerealityCompanion.MinimalRunner\ViscerealityCompanion.MinimalRunner.csproj" />
     <ProjectReference Include="..\..\src\ViscerealityCompanion.PreviewInstaller\ViscerealityCompanion.PreviewInstaller.csproj" />
     <ProjectReference Include="..\..\tools\ViscerealityCompanion.VerificationHarness\ViscerealityCompanion.VerificationHarness.csproj" />
   </ItemGroup>

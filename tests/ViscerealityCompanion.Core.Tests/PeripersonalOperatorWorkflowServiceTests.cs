@@ -19,7 +19,9 @@ public sealed class PeripersonalOperatorWorkflowServiceTests
             var result = await workflow.PrepareSessionAsync(new PeripersonalSessionSetupRequest(
                 ParticipantRef: "P001",
                 SessionId: "session-1",
-                Handedness: "right-handed"));
+                Handedness: "right-handed",
+                ParticipantName: "Participant Example",
+                ParticipantNumber: "P001"));
 
             Assert.True(result.Succeeded);
             Assert.Equal(PeripersonalOperatorWorkflowState.Prepared, workflow.State);
@@ -35,11 +37,17 @@ public sealed class PeripersonalOperatorWorkflowServiceTests
             Assert.Equal("peripersonal_particle_triggers_P001", transport.SentCommands[0].Payload?["particle_trigger_lsl_stream_name"]?.GetValue<string>());
             Assert.Equal("peripersonal-space-P001-session-1", transport.SentCommands[0].Payload?["dataset_id"]?.GetValue<string>());
             Assert.Equal("peripersonal-space-P001-session-1", transport.SentCommands[0].Payload?["dataset_hash"]?.GetValue<string>());
+            Assert.Equal("P001", transport.SentCommands[0].Payload?["participant_number"]?.GetValue<string>());
+            Assert.Equal("Participant Example", transport.SentCommands[0].Payload?["participant_name"]?.GetValue<string>());
+            Assert.False(transport.SentCommands[0].Payload?["initial_particles_visible"]?.GetValue<bool>());
+            Assert.False(transport.SentCommands[0].Payload?["particles_visible_standard_state"]?.GetValue<bool>());
             Assert.Equal("quest_questionnaire_panel_apk", transport.SentCommands[1].TargetRuntimeKind);
             Assert.Equal("io.github.mesmerprism.questquestionnaire.panel", transport.SentCommands[1].TargetPackage);
             var metadata = File.ReadAllText(Path.Combine(session.WindowsSessionDirectory, "windows_session_metadata.json"));
             Assert.Contains("\"dataset_id\": \"peripersonal-space-P001-session-1\"", metadata, StringComparison.Ordinal);
             Assert.Contains("\"dataset_hash\": \"peripersonal-space-P001-session-1\"", metadata, StringComparison.Ordinal);
+            Assert.Contains("\"participant_number\": \"P001\"", metadata, StringComparison.Ordinal);
+            Assert.Contains("\"participant_name\": \"Participant Example\"", metadata, StringComparison.Ordinal);
 
             var ledgerLines = File.ReadAllLines(session.LedgerPath);
             Assert.Equal(6, ledgerLines.Length);
@@ -54,7 +62,7 @@ public sealed class PeripersonalOperatorWorkflowServiceTests
     }
 
     [Fact]
-    public async Task StartRecording_IsBlockedUntilQuestionnaireBlockOneThenUsesOneGlobalStartAndFinalStop()
+    public async Task StartRecording_CanStartBeforeQuestionnaireBlockOneThenUsesOneGlobalStartAndFinalStop()
     {
         var root = CreateTempRoot();
         try
@@ -68,15 +76,12 @@ public sealed class PeripersonalOperatorWorkflowServiceTests
                 SessionId: "session-1",
                 Handedness: "right-handed"));
 
-            var blockedStart = await workflow.StartRecordingAsync();
-            Assert.False(blockedStart.Succeeded);
-            Assert.Equal(OperationOutcomeKind.Warning, blockedStart.Outcome.Kind);
-            Assert.DoesNotContain(transport.CommandLog, command => command.EndsWith(":start_recording", StringComparison.Ordinal));
-
-            workflow.RecordQuestionnaireSubmitted("block-1");
             var started = await workflow.StartRecordingAsync();
             Assert.True(started.Succeeded);
             Assert.Equal(PeripersonalOperatorWorkflowState.Recording, workflow.State);
+
+            var block1Submitted = workflow.RecordQuestionnaireSubmitted("block-1");
+            Assert.True(block1Submitted.Succeeded);
 
             var blockEnd = await workflow.MarkXrBlockEndAsync("xr-block-1", "left-visible");
             Assert.True(blockEnd.Succeeded);
@@ -94,6 +99,60 @@ public sealed class PeripersonalOperatorWorkflowServiceTests
             var pulledSessionFolder = Assert.Single(backupPuller.PulledSessionFolders);
             Assert.Equal("P001_session-1_20260620-123456", pulledSessionFolder);
             Assert.Equal(Path.Combine(workflow.CurrentSession!.WindowsSessionDirectory, "device-session-pull"), stopped.Outcome.SafeItems.Single());
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task StartExperimentAndOpenBlockOne_StartsRecordingForcesParticlesOffAndLaunchesBlockOne()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var transport = new FakePeripersonalCommandTransport();
+            var workflow = CreateWorkflow(root, transport);
+            await workflow.PrepareSessionAsync(new PeripersonalSessionSetupRequest(
+                ParticipantRef: "P001",
+                SessionId: "session-1",
+                Handedness: "right-handed",
+                LanguageCode: "en"));
+
+            var started = await workflow.StartExperimentAndOpenBlockOneAsync();
+
+            Assert.True(started.Succeeded, started.Outcome.Detail);
+            Assert.Equal(PeripersonalOperatorWorkflowState.Recording, workflow.State);
+            Assert.Equal(
+                [
+                    "unity:prepare_session",
+                    "panel:prepare_session",
+                    "unity:start_recording",
+                    "unity:set_particles_hidden",
+                    "unity:open_questionnaire_block"
+                ],
+                transport.CommandLog);
+
+            var startCommand = transport.SentCommands[2];
+            Assert.Equal("peripersonal_runtime_state_P001", startCommand.Payload?["runtime_state_lsl_stream_name"]?.GetValue<string>());
+            Assert.Equal("peripersonal_particle_triggers_P001", startCommand.Payload?["particle_trigger_lsl_stream_name"]?.GetValue<string>());
+            Assert.Equal(PeripersonalOperatorWorkflowService.RecordingLifecycle, startCommand.Payload?["recording_lifecycle"]?.GetValue<string>());
+
+            var particlesCommand = transport.SentCommands[3];
+            Assert.False(particlesCommand.Payload?["particles_visible"]?.GetValue<bool>());
+            Assert.Equal("Particles-OFF", particlesCommand.Payload?["particle_trigger_label"]?.GetValue<string>());
+
+            AssertMaiaQuestionnaireCommand(
+                transport.SentCommands[4],
+                "block-1",
+                PeripersonalOperatorWorkflowService.PanelQuestionnaireBlock1LanguageStage,
+                [
+                    PeripersonalOperatorWorkflowService.PanelQuestionnaireBlock1LanguageStage,
+                    PeripersonalOperatorWorkflowService.PanelQuestionnaireBlock1DemographicsStage,
+                    PeripersonalOperatorWorkflowService.PanelQuestionnaireBlock1Maia2Stage
+                ],
+                "en");
         }
         finally
         {
@@ -147,7 +206,7 @@ public sealed class PeripersonalOperatorWorkflowServiceTests
     }
 
     [Fact]
-    public async Task OpenQuestionnaireBlock_UsesMaiaSpatialRendererContractForBlocksTwoAndThree()
+    public async Task OpenQuestionnaireBlock_UsesMaiaSpatialRendererContractForBlocksTwoAndThreeWithoutBlockOneGate()
     {
         var root = CreateTempRoot();
         try
@@ -159,7 +218,6 @@ public sealed class PeripersonalOperatorWorkflowServiceTests
                 SessionId: "session-1",
                 Handedness: "right-handed",
                 LanguageCode: "de"));
-            workflow.RecordQuestionnaireSubmitted("block-1");
             var started = await workflow.StartRecordingAsync();
             Assert.True(started.Succeeded);
 
@@ -227,6 +285,96 @@ public sealed class PeripersonalOperatorWorkflowServiceTests
         }
     }
 
+    [Theory]
+    [InlineData("block-2", 2, PeripersonalOperatorWorkflowService.PanelQuestionnaireBlock2SpatialFrameStage)]
+    [InlineData("block-3", 3, PeripersonalOperatorWorkflowService.PanelQuestionnaireBlock3SpatialFrameStage)]
+    public async Task CloseQuestionnaireBlock_SendsCloseCommandWithoutRecordingSubmission(
+        string blockId,
+        int conditionNumber,
+        string expectedStage)
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var transport = new FakePeripersonalCommandTransport();
+            var workflow = CreatePreparedRecordingWorkflow(root, transport);
+
+            var closed = await workflow.CloseQuestionnaireBlockAsync(
+                $"close-request-{conditionNumber}",
+                blockId,
+                conditionNumber: conditionNumber);
+
+            Assert.True(closed.Succeeded);
+            var command = transport.SentCommands.Single(item => item.Action == "close_questionnaire_block");
+            Assert.Equal($"close-request-{conditionNumber}", command.Payload?["request_id"]?.GetValue<string>());
+            Assert.Equal(blockId, command.Payload?["operator_questionnaire_block_id"]?.GetValue<string>());
+            Assert.Equal(expectedStage, command.Payload?["open_stage"]?.GetValue<string>());
+            Assert.Equal("close_requested", command.Payload?["questionnaire_status"]?.GetValue<string>());
+            Assert.Equal(conditionNumber, command.Payload?["condition_number"]?.GetValue<int>());
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task OpenQuestionnaireBlock_DoesNotSucceedWithoutObservedLaunchState()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var transport = new FakePeripersonalCommandTransport
+            {
+                EmitQuestionnaireLaunchObservedState = false
+            };
+            var workflow = CreatePreparedRecordingWorkflow(root, transport);
+
+            var opened = await workflow.OpenQuestionnaireBlockAsync(
+                "request-unconfirmed-launch",
+                "block-2",
+                ["block-2"],
+                conditionNumber: 2);
+
+            Assert.False(opened.Succeeded);
+            Assert.Equal(OperationOutcomeKind.Warning, opened.Outcome.Kind);
+            Assert.Contains("observed-state gate", opened.Outcome.Summary, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains(transport.SentCommands, command => command.Action == "open_questionnaire_block");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task CloseQuestionnaireBlock_DoesNotSucceedWithoutObservedCloseState()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var transport = new FakePeripersonalCommandTransport
+            {
+                EmitQuestionnaireCloseObservedState = false
+            };
+            var workflow = CreatePreparedRecordingWorkflow(root, transport);
+
+            var closed = await workflow.CloseQuestionnaireBlockAsync(
+                "close-unconfirmed",
+                "block-2",
+                conditionNumber: 2);
+
+            Assert.False(closed.Succeeded);
+            Assert.Equal(OperationOutcomeKind.Warning, closed.Outcome.Kind);
+            Assert.Contains("observed-state gate", closed.Outcome.Summary, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains(transport.SentCommands, command => command.Action == "close_questionnaire_block");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     [Fact]
     public async Task ParticleVisibilityCommandsCarryDistinctTriggerLabels()
     {
@@ -247,6 +395,31 @@ public sealed class PeripersonalOperatorWorkflowServiceTests
             Assert.Equal(2, particleCommands.Length);
             Assert.Equal("Particles-ON", particleCommands[0].Payload?["particle_trigger_label"]?.GetValue<string>());
             Assert.Equal("Particles-OFF", particleCommands[1].Payload?["particle_trigger_label"]?.GetValue<string>());
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ParticleVisibilityCommand_DoesNotSucceedWithoutObservedParticleState()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var transport = new FakePeripersonalCommandTransport
+            {
+                EmitParticleObservedState = false
+            };
+            var workflow = CreatePreparedRecordingWorkflow(root, transport);
+
+            var result = await workflow.SetParticlesVisibleAsync(true);
+
+            Assert.False(result.Succeeded);
+            Assert.Equal(OperationOutcomeKind.Warning, result.Outcome.Kind);
+            Assert.Contains("observed-state gate", result.Outcome.Summary, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains(transport.SentCommands, command => command.Action == "set_particles_visible");
         }
         finally
         {
@@ -569,6 +742,9 @@ public sealed class PeripersonalOperatorWorkflowServiceTests
     {
         public List<PeripersonalCommandEnvelope> SentCommands { get; } = [];
         public List<string> CommandLog { get; } = [];
+        public bool EmitParticleObservedState { get; init; } = true;
+        public bool EmitQuestionnaireLaunchObservedState { get; init; } = true;
+        public bool EmitQuestionnaireCloseObservedState { get; init; } = true;
 
         public Task<PeripersonalCommandReceiptEnvelope> SendAsync(
             PeripersonalCommandEnvelope command,
@@ -589,9 +765,24 @@ public sealed class PeripersonalOperatorWorkflowServiceTests
                 ["quest_apps_close_requested"] = command.Action == "stop_recording_and_close_apps",
                 ["session_folder_name"] = command.Payload?["session_folder_name"]?.GetValue<string>() ?? string.Empty
             };
-            if (command.Payload?["particles_visible"] is JsonNode particlesNode)
+            if (EmitParticleObservedState
+                && command.Payload?["particles_visible"] is JsonNode particlesNode)
             {
                 observedState["particles_visible"] = particlesNode.GetValue<bool>();
+            }
+
+            if (EmitQuestionnaireLaunchObservedState
+                && command.Action == "open_questionnaire_block")
+            {
+                observedState["questionnaire_status"] = "launch_requested";
+                observedState["operator_questionnaire_block_id"] = command.Payload?["operator_questionnaire_block_id"]?.GetValue<string>() ?? string.Empty;
+            }
+
+            if (EmitQuestionnaireCloseObservedState
+                && command.Action == "close_questionnaire_block")
+            {
+                observedState["questionnaire_status"] = "closed";
+                observedState["operator_questionnaire_block_id"] = command.Payload?["operator_questionnaire_block_id"]?.GetValue<string>() ?? string.Empty;
             }
 
             return Task.FromResult(PeripersonalCommandReceiptEnvelope.Create(

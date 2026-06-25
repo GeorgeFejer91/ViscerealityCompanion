@@ -28,7 +28,9 @@ public sealed record PeripersonalSessionSetupRequest(
     string Handedness,
     string StudyId = "",
     string LanguageCode = "",
-    string InitialConditionId = "");
+    string InitialConditionId = "",
+    string ParticipantName = "",
+    string ParticipantNumber = "");
 
 public sealed record PeripersonalPreparedSession(
     string StudyId,
@@ -41,7 +43,9 @@ public sealed record PeripersonalPreparedSession(
     string LedgerPath,
     DateTimeOffset PreparedAtUtc,
     string LanguageCode = "",
-    string InitialConditionId = "");
+    string InitialConditionId = "",
+    string ParticipantName = "",
+    string ParticipantNumber = "");
 
 public sealed record PeripersonalWorkflowOperationResult(
     OperationOutcome Outcome,
@@ -63,7 +67,7 @@ public sealed record PeripersonalClockProbeOperationResult(
 public sealed class PeripersonalOperatorWorkflowService
 {
     public const string SessionFolderConvention = "participantRef_sessionId_yyyyMMdd-HHmmss";
-    public const string RecordingLifecycle = "one_global_recording_after_block_1";
+    public const string RecordingLifecycle = "one_global_recording_after_metadata_preparation";
     public const string RuntimeStateStreamPrefix = "peripersonal_runtime_state";
     public const string ParticleTriggerStreamPrefix = "peripersonal_particle_triggers";
     public const string PanelQuestionnaireId = "maia2-spatial-frame-questionnaire-v1";
@@ -92,12 +96,14 @@ public sealed class PeripersonalOperatorWorkflowService
     private readonly IPeripersonalCommandTransport _transport;
     private readonly IPeripersonalQuestAppCloser _questAppCloser;
     private readonly IPeripersonalQuestBackupPuller _questBackupPuller;
+    private readonly IPeripersonalQuestHttpForwarder _questHttpForwarder;
     private readonly Func<DateTimeOffset> _utcNow;
     private readonly string _windowsSessionRoot;
     private readonly List<PeripersonalCommandLedgerSnapshot> _snapshots = [];
     private PeripersonalPreparedSession? _session;
     private PeripersonalCommandLedgerService? _ledger;
     private bool _questionnaireBlockOneSubmitted;
+    private OperationOutcome? _unityHttpBridgeForwardOutcome;
 
     public PeripersonalOperatorWorkflowService(
         StudyShellDefinition study,
@@ -105,12 +111,14 @@ public sealed class PeripersonalOperatorWorkflowService
         string? windowsSessionRoot = null,
         Func<DateTimeOffset>? utcNow = null,
         IPeripersonalQuestAppCloser? questAppCloser = null,
-        IPeripersonalQuestBackupPuller? questBackupPuller = null)
+        IPeripersonalQuestBackupPuller? questBackupPuller = null,
+        IPeripersonalQuestHttpForwarder? questHttpForwarder = null)
     {
         _study = study ?? throw new ArgumentNullException(nameof(study));
         _transport = transport ?? throw new ArgumentNullException(nameof(transport));
         _questAppCloser = questAppCloser ?? NoOpPeripersonalQuestAppCloser.Instance;
         _questBackupPuller = questBackupPuller ?? NoOpPeripersonalQuestBackupPuller.Instance;
+        _questHttpForwarder = questHttpForwarder ?? NoOpPeripersonalQuestHttpForwarder.Instance;
         _windowsSessionRoot = string.IsNullOrWhiteSpace(windowsSessionRoot)
             ? Path.Combine(CompanionOperatorDataLayout.StudyDataRootPath, study.Id)
             : Path.GetFullPath(windowsSessionRoot);
@@ -151,11 +159,21 @@ public sealed class PeripersonalOperatorWorkflowService
             return Result(OperationOutcomeKind.Warning, "Session is already prepared.", "Start a new workflow service instance for a new participant session.");
         }
 
+        var httpForward = await EnsureUnityHttpBridgeForwardAsync(cancellationToken).ConfigureAwait(false);
+        if (httpForward.Kind == OperationOutcomeKind.Failure)
+        {
+            return Result(httpForward.Kind, httpForward.Summary, httpForward.Detail, items: httpForward.SafeItems);
+        }
+
         var participantRef = RequireValue(request.ParticipantRef, nameof(request.ParticipantRef));
         var sessionId = RequireValue(request.SessionId, nameof(request.SessionId));
         var handedness = RequireValue(request.Handedness, nameof(request.Handedness));
         var languageCode = NormalizeLanguageCode(request.LanguageCode);
         var initialConditionId = request.InitialConditionId?.Trim() ?? string.Empty;
+        var participantName = request.ParticipantName?.Trim() ?? string.Empty;
+        var participantNumber = string.IsNullOrWhiteSpace(request.ParticipantNumber)
+            ? participantRef
+            : request.ParticipantNumber.Trim();
         var breathSide = BreathTrackingControllerFromHandedness(handedness);
         if (string.IsNullOrWhiteSpace(breathSide))
         {
@@ -182,7 +200,9 @@ public sealed class PeripersonalOperatorWorkflowService
             _ledger.LedgerPath,
             preparedAtUtc,
             languageCode,
-            initialConditionId);
+            initialConditionId,
+            participantName,
+            participantNumber);
         WriteWindowsSessionMetadata(_session, request);
 
         var unityResult = await SendAndVerifyAsync(
@@ -217,7 +237,9 @@ public sealed class PeripersonalOperatorWorkflowService
         return Result(
             OperationOutcomeKind.Success,
             "Peripersonal session prepared.",
-            $"Windows, Unity, and panel session folders are prepared as {sessionFolderName}.",
+            JoinDetails(
+                $"Windows, Unity, and panel session folders are prepared as {sessionFolderName}.",
+                httpForward.Detail),
             _session);
     }
 
@@ -226,7 +248,7 @@ public sealed class PeripersonalOperatorWorkflowService
         if (IsOperatorQuestionnaireBlockOne(blockId))
         {
             _questionnaireBlockOneSubmitted = true;
-            return Result(OperationOutcomeKind.Success, "Questionnaire Block 1 marked complete.", "Global recording can now start.");
+            return Result(OperationOutcomeKind.Success, "Questionnaire Block 1 marked complete.", "Block 1 completion was logged inside the active session flow.");
         }
 
         return Result(OperationOutcomeKind.Success, "Questionnaire block marked complete.", blockId?.Trim() ?? string.Empty);
@@ -237,14 +259,6 @@ public sealed class PeripersonalOperatorWorkflowService
         if (State != PeripersonalOperatorWorkflowState.Prepared || _session is null)
         {
             return Result(OperationOutcomeKind.Warning, "Session is not ready to record.", "Run prepare_session before Start Recording.");
-        }
-
-        if (!_questionnaireBlockOneSubmitted)
-        {
-            return Result(
-                OperationOutcomeKind.Warning,
-                "Start Recording is blocked until Questionnaire Block 1 is submitted.",
-                "George's workflow starts one global recording after Block 1, not at the beginning of setup.");
         }
 
         var result = await SendAndVerifyAsync(
@@ -263,6 +277,45 @@ public sealed class PeripersonalOperatorWorkflowService
         }
 
         return result;
+    }
+
+    public async Task<PeripersonalWorkflowOperationResult> StartExperimentAndOpenBlockOneAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (State != PeripersonalOperatorWorkflowState.Prepared || _session is null)
+        {
+            return Result(OperationOutcomeKind.Warning, "Session is not ready to start.", "Prepare the session metadata before Start Experiment.");
+        }
+
+        var recordingResult = await StartRecordingAsync(cancellationToken).ConfigureAwait(false);
+        if (!recordingResult.Succeeded)
+        {
+            return recordingResult;
+        }
+
+        var particlesOffResult = await SetParticlesVisibleAsync(false, cancellationToken).ConfigureAwait(false);
+        if (!particlesOffResult.Succeeded)
+        {
+            return particlesOffResult;
+        }
+
+        var blockOneResult = await OpenQuestionnaireBlockAsync(
+                $"start-experiment-block-1-{_utcNow().ToUniversalTime():yyyyMMddHHmmssfff}",
+                "block-1",
+                ["block-1"],
+                conditionNumber: 1,
+                cancellationToken: cancellationToken)
+            .ConfigureAwait(false);
+        if (!blockOneResult.Succeeded)
+        {
+            return blockOneResult;
+        }
+
+        return Result(
+            OperationOutcomeKind.Success,
+            "Experiment started and Block 1 opened.",
+            "Unity recording is active, particles are hidden as the standard state, and Questionnaire Block 1 has been launched over the runtime.",
+            _session);
     }
 
     public Task<PeripersonalWorkflowOperationResult> MarkXrBlockEndAsync(
@@ -388,12 +441,6 @@ public sealed class PeripersonalOperatorWorkflowService
             return Task.FromResult(Result(OperationOutcomeKind.Warning, "Questionnaire launch is blocked.", "Prepare the session before opening the Quest questionnaire panel."));
         }
 
-        if (!_questionnaireBlockOneSubmitted &&
-            !IsOperatorQuestionnaireBlockOne(openStage))
-        {
-            return Task.FromResult(Result(OperationOutcomeKind.Warning, "Questionnaire launch is blocked.", "Only Questionnaire Block 1 can run before the global recording starts."));
-        }
-
         if (!IsOperatorQuestionnaireBlockOne(openStage) &&
             State != PeripersonalOperatorWorkflowState.Recording)
         {
@@ -408,7 +455,7 @@ public sealed class PeripersonalOperatorWorkflowService
             "unity_quest_apk",
             _study.App.PackageId,
             "open_questionnaire_block",
-            requiresObservedState: false,
+            requiresObservedState: true,
             BuildSessionPayload(_session, null, payload =>
             {
                 payload["request_id"] = RequireValue(requestId, nameof(requestId));
@@ -432,7 +479,40 @@ public sealed class PeripersonalOperatorWorkflowService
                     payload["debug_command_interval_ms"] = Math.Clamp(participantCommandIntervalMs.Value, 0, 10000);
                 }
             }),
-            _ => true,
+            QuestionnaireLaunchObserved,
+            cancellationToken);
+    }
+
+    public Task<PeripersonalWorkflowOperationResult> CloseQuestionnaireBlockAsync(
+        string requestId,
+        string blockId,
+        int? conditionNumber = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (_session is null || State != PeripersonalOperatorWorkflowState.Recording)
+        {
+            return Task.FromResult(Result(OperationOutcomeKind.Warning, "Questionnaire close is blocked.", "Questionnaire block switches can only be turned off while the single global recording remains active."));
+        }
+
+        var normalizedBlockId = RequireValue(blockId, nameof(blockId));
+        return SendAndVerifyAsync(
+            "unity",
+            "unity_quest_apk",
+            _study.App.PackageId,
+            "close_questionnaire_block",
+            requiresObservedState: true,
+            BuildSessionPayload(_session, null, payload =>
+            {
+                payload["request_id"] = RequireValue(requestId, nameof(requestId));
+                payload["operator_questionnaire_block_id"] = normalizedBlockId;
+                payload["open_stage"] = NormalizePanelQuestionnaireStage(normalizedBlockId);
+                payload["questionnaire_status"] = "close_requested";
+                if (conditionNumber.HasValue)
+                {
+                    payload["condition_number"] = conditionNumber.Value;
+                }
+            }),
+            QuestionnaireCloseObserved,
             cancellationToken);
     }
 
@@ -685,6 +765,19 @@ public sealed class PeripersonalOperatorWorkflowService
         return Result(OperationOutcomeKind.Success, $"{action} command completed.", receipt.Message);
     }
 
+    private async Task<OperationOutcome> EnsureUnityHttpBridgeForwardAsync(CancellationToken cancellationToken)
+    {
+        if (_unityHttpBridgeForwardOutcome is not null)
+        {
+            return _unityHttpBridgeForwardOutcome;
+        }
+
+        _unityHttpBridgeForwardOutcome = await _questHttpForwarder
+            .EnsureUnityHttpBridgeForwardAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return _unityHttpBridgeForwardOutcome;
+    }
+
     private JsonObject BuildSessionPayload(
         PeripersonalPreparedSession session,
         PeripersonalSessionSetupRequest? request,
@@ -700,6 +793,8 @@ public sealed class PeripersonalOperatorWorkflowService
             ["dataset_id"] = datasetId,
             ["dataset_hash"] = datasetId,
             ["participant_ref"] = session.ParticipantRef,
+            ["participant_number"] = string.IsNullOrWhiteSpace(session.ParticipantNumber) ? session.ParticipantRef : session.ParticipantNumber,
+            ["participant_name"] = session.ParticipantName,
             ["handedness"] = session.Handedness,
             ["breath_tracking_controller_side"] = session.BreathTrackingControllerSide,
             ["session_folder_name"] = session.SessionFolderName,
@@ -710,7 +805,9 @@ public sealed class PeripersonalOperatorWorkflowService
             ["runtime_state_lsl_stream_name"] = participantScopedRuntimeStateStream,
             ["particle_trigger_lsl_stream_name"] = participantScopedParticleStream,
             ["unity_lsl_stream_name_must_include_participant_ref"] = true,
-            ["questionnaires_run_during_global_recording"] = true
+            ["questionnaires_run_during_global_recording"] = true,
+            ["initial_particles_visible"] = false,
+            ["particles_visible_standard_state"] = false
         };
         customize?.Invoke(payload);
         return payload;
@@ -727,6 +824,8 @@ public sealed class PeripersonalOperatorWorkflowService
             target_app = "windows_operator",
             study_id = session.StudyId,
             participant_ref = session.ParticipantRef,
+            participant_number = string.IsNullOrWhiteSpace(session.ParticipantNumber) ? session.ParticipantRef : session.ParticipantNumber,
+            participant_name = session.ParticipantName,
             session_id = session.SessionId,
             dataset_id = datasetId,
             dataset_hash = datasetId,
@@ -792,6 +891,18 @@ public sealed class PeripersonalOperatorWorkflowService
         => BoolObserved(observedState, "session_ready", expected: true) &&
            StringObserved(observedState, "session_folder_name", sessionFolderName, allowMissing: true);
 
+    private static bool QuestionnaireLaunchObserved(JsonObject? observedState)
+        => StringObservedContainsAny(
+            observedState,
+            ["questionnaire_status", "panel_status", "questionnaire.status", "panel.status"],
+            ["launch_requested", "open_requested", "opened", "on_screen", "shown", "displayed", "visible"]);
+
+    private static bool QuestionnaireCloseObserved(JsonObject? observedState)
+        => StringObservedContainsAny(
+            observedState,
+            ["questionnaire_status", "panel_status", "questionnaire.status", "panel.status"],
+            ["close_requested", "closed", "hide_requested", "hidden", "dismissed", "returned_to_unity", "off"]);
+
     private static bool BoolObserved(JsonObject? observedState, string key, bool expected)
     {
         var node = observedState?[key];
@@ -818,6 +929,58 @@ public sealed class PeripersonalOperatorWorkflowService
         }
 
         return string.Equals(node.GetValue<string>(), expected, StringComparison.Ordinal);
+    }
+
+    private static bool StringObservedContainsAny(JsonObject? observedState, IReadOnlyList<string> keys, IReadOnlyList<string> expectedFragments)
+    {
+        if (observedState is null)
+        {
+            return false;
+        }
+
+        foreach (var key in keys)
+        {
+            if (!TryGetObservedString(observedState, key, out var value))
+            {
+                continue;
+            }
+
+            if (expectedFragments.Any(fragment => value.Contains(fragment, StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryGetObservedString(JsonObject observedState, string key, out string value)
+    {
+        if (observedState.TryGetPropertyValue(key, out var node)
+            && node is not null)
+        {
+            value = node.GetValueKind() == JsonValueKind.String
+                ? node.GetValue<string>()
+                : node.ToJsonString();
+            return !string.IsNullOrWhiteSpace(value);
+        }
+
+        var suffix = "." + key;
+        var underscoreSuffix = "_" + key.Replace('.', '_');
+        var match = observedState.FirstOrDefault(pair =>
+            pair.Value is not null
+            && (pair.Key.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)
+                || pair.Key.EndsWith(underscoreSuffix, StringComparison.OrdinalIgnoreCase)));
+        if (match.Value is not null)
+        {
+            value = match.Value.GetValueKind() == JsonValueKind.String
+                ? match.Value.GetValue<string>()
+                : match.Value.ToJsonString();
+            return !string.IsNullOrWhiteSpace(value);
+        }
+
+        value = string.Empty;
+        return false;
     }
 
     private static string RequireValue(string value, string name)

@@ -1,5 +1,7 @@
 using System.Windows;
 using ViscerealityCompanion.App;
+using ViscerealityCompanion.Core.Models;
+using ViscerealityCompanion.Core.Services;
 
 namespace ViscerealityCompanion.App.ViewModels;
 
@@ -159,6 +161,163 @@ public sealed partial class StudyShellViewModel
             _experimentSessionWindow.Closed -= OnExperimentSessionWindowClosed;
             _experimentSessionWindow = null;
         }
+    }
+
+    public bool ShouldPromptForPeripersonalSessionPreparation
+        => _isPeripersonalWorkflow
+            && _peripersonalWorkflow?.State is not PeripersonalOperatorWorkflowState.Prepared
+            && _peripersonalWorkflow?.State is not PeripersonalOperatorWorkflowState.Recording;
+
+    public Task<bool> SavePeripersonalSessionPreparationAsync()
+    {
+        if (!CanSavePeripersonalSessionPreparation)
+        {
+            return Task.FromResult(false);
+        }
+
+        var state = CapturePeripersonalSessionPreparationState();
+        state.Save();
+        PeripersonalParticipantLedger.Append(state);
+        ApplyPeripersonalSessionPreparationState(state);
+        return Task.FromResult(true);
+    }
+
+    public async Task<bool> StartPreparedPeripersonalSessionAsync()
+    {
+        if (!CanSavePeripersonalSessionPreparation)
+        {
+            return false;
+        }
+
+        var state = CapturePeripersonalSessionPreparationState();
+        state.Save();
+        PeripersonalParticipantLedger.Append(state);
+        ApplyPeripersonalSessionPreparationState(state);
+
+        if (!IsRequiredExperimentWifiReady())
+        {
+            await ApplyOutcomeAsync(
+                "Start Session",
+                new OperationOutcome(
+                    OperationOutcomeKind.Warning,
+                    $"Connect both devices to {RequiredExperimentWifiSsid}.",
+                    BuildRequiredExperimentWifiDetail(_headsetStatus))).ConfigureAwait(false);
+            return false;
+        }
+
+        if (_peripersonalWorkflow?.State is PeripersonalOperatorWorkflowState.Prepared or PeripersonalOperatorWorkflowState.Recording)
+        {
+            return true;
+        }
+
+        await PreparePeripersonalSessionAsync().ConfigureAwait(false);
+        return _peripersonalWorkflow?.State is PeripersonalOperatorWorkflowState.Prepared or PeripersonalOperatorWorkflowState.Recording;
+    }
+
+    public async Task<bool> StartPluggedInPeripersonalSessionAsync()
+    {
+        const string ActionLabel = "Start Session";
+
+        if (!CanSavePeripersonalSessionPreparation)
+        {
+            await ApplyOutcomeAsync(
+                ActionLabel,
+                new OperationOutcome(
+                    OperationOutcomeKind.Warning,
+                    "Participant setup is incomplete.",
+                    "Enter participant name, participant number, age, and handedness before starting the session.")).ConfigureAwait(false);
+            return false;
+        }
+
+        await RefreshStatusAsync().ConfigureAwait(false);
+
+        if (_headsetStatus?.IsUsbAdbVisible != true)
+        {
+            await ApplyOutcomeAsync(
+                ActionLabel,
+                new OperationOutcome(
+                    OperationOutcomeKind.Warning,
+                    "Keep the headset plugged in for this setup step.",
+                    "The setup step expects a USB-visible Quest before it launches Unity, sends the metadata, starts recording/streams, forces particles off, and opens Block 1. Reconnect USB, keep the headset awake, then press Start Session again.")).ConfigureAwait(false);
+            return false;
+        }
+
+        var state = await DispatchAsync(CapturePeripersonalSessionPreparationState).ConfigureAwait(false);
+        state.Save();
+        PeripersonalParticipantLedger.Append(state);
+        await DispatchAsync(() => ApplyPeripersonalSessionPreparationState(state)).ConfigureAwait(false);
+
+        await StartExperimentAsync().ConfigureAwait(false);
+
+        return _peripersonalWorkflow?.State == PeripersonalOperatorWorkflowState.Recording
+            && IsPeripersonalQuestionnaireBlockVisible(PeripersonalBlockOneId);
+    }
+
+    public bool LoadPeripersonalSessionPreparation()
+    {
+        var state = PeripersonalSessionPreparationState.Load();
+        if (state is null)
+        {
+            return false;
+        }
+
+        ApplyPeripersonalSessionPreparationState(state);
+        return true;
+    }
+
+    private PeripersonalSessionPreparationState CapturePeripersonalSessionPreparationState()
+        => PeripersonalSessionPreparationState.Create(
+            _study.Id,
+            ParticipantIdDraft,
+            PeripersonalParticipantNameDraft,
+            PeripersonalParticipantAgeDraft,
+            PeripersonalSessionIdDraft,
+            PeripersonalHandednessDraft,
+            PeripersonalLanguageCodeDraft,
+            SelectedCondition?.Id);
+
+    private void ApplyPeripersonalSessionPreparationState(PeripersonalSessionPreparationState state)
+    {
+        if (!string.IsNullOrWhiteSpace(state.StudyId)
+            && !string.Equals(state.StudyId, _study.Id, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var participantName = state.ParticipantName ?? string.Empty;
+        var participantNumber = string.IsNullOrWhiteSpace(state.ParticipantNumber)
+            ? PeripersonalParticipantNumberDisplay
+            : state.ParticipantNumber.Trim();
+        if (TryParsePeripersonalParticipantNumber(participantNumber, out var parsedParticipantNumber))
+        {
+            SetPeripersonalParticipantNumber(parsedParticipantNumber, loadLedgerEntry: false);
+        }
+        else
+        {
+            SetPeripersonalParticipantNumber(PeripersonalParticipantNumberMinimum, loadLedgerEntry: false);
+        }
+
+        PeripersonalParticipantNameDraft = participantName;
+        PeripersonalParticipantAgeDraft = state.Age;
+        PeripersonalSessionIdDraft = state.SessionId;
+        PeripersonalHandednessDraft = state.Handedness;
+        PeripersonalLanguageCodeDraft = state.LanguageCode;
+
+        if (!string.IsNullOrWhiteSpace(state.InitialConditionId))
+        {
+            var matchingCondition = Conditions.FirstOrDefault(condition =>
+                string.Equals(condition.Id, state.InitialConditionId, StringComparison.OrdinalIgnoreCase));
+            if (matchingCondition is not null)
+            {
+                SelectedCondition = matchingCondition;
+            }
+        }
+
+        PeripersonalWorkflowLevel = OperationOutcomeKind.Success;
+        PeripersonalWorkflowSummary = "Peripersonal session metadata is loaded.";
+        PeripersonalWorkflowDetail = $"Loaded participant/session variables from {PeripersonalPreparationFilePath}. Start Experiment will send these values to the runtime and begin recording.";
+        UpdateParticipantSessionState();
+        RefreshPeripersonalWorkflowProperties();
     }
 
     private void CloseExperimentSessionWindow()

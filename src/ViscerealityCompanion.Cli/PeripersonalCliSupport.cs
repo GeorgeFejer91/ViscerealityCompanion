@@ -189,7 +189,7 @@ public static partial class Program
         Option<string?> statePathOption,
         Option<int> receiptTimeoutOption)
     {
-        var cliCommand = new Command("start-recording", "Start the one global Peripersonal recording after Block 1");
+        var cliCommand = new Command("start-recording", "Start the one global Peripersonal recording after session metadata is prepared");
         cliCommand.Handler = CommandHandler.Create(async (
             string study,
             string? root,

@@ -578,7 +578,7 @@ public sealed class StudyShellWorkflowGuideRegressionTests
     }
 
     [Fact]
-    public void WifiMatchGate_Passes_WhenQuestIsReachableOverEthernetRoutedHostPath()
+    public void WifiMatchGate_Fails_WhenQuestIsReachableOverEthernetButNotRequiredWifi()
     {
         var viewModel = CreateViewModel(CreateStudy());
         SetPrivateField(viewModel, "_headsetStatus", CreateConnectedHeadsetStatus("com.Viscereality.SussexExperiment") with
@@ -610,15 +610,15 @@ public sealed class StudyShellWorkflowGuideRegressionTests
 
         var gate = InvokePrivateMethod<WorkflowGuideGateState>(viewModel, "BuildWifiMatchWorkflowGuideGateState");
 
-        Assert.True(gate.Ready);
-        Assert.Equal(OperationOutcomeKind.Success, gate.Level);
-        Assert.Contains("router path", gate.Summary, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("not required", gate.Detail, StringComparison.OrdinalIgnoreCase);
+        Assert.False(gate.Ready);
+        Assert.Equal(OperationOutcomeKind.Failure, gate.Level);
+        Assert.Contains("NFTulpa", gate.Summary, StringComparison.Ordinal);
+        Assert.Contains("NFTulpa", gate.Detail, StringComparison.Ordinal);
         Assert.DoesNotContain("change the headset Wi-Fi manually", gate.Detail, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public void WifiMatchGate_Passes_WhenQuestIsReachableOverEthernetRoutedHostPathAndWifiNamesAreUnavailable()
+    public void WifiMatchGate_Warns_WhenQuestIsReachableButWifiNamesAreUnavailable()
     {
         var viewModel = CreateViewModel(CreateStudy());
         SetPrivateField(viewModel, "_headsetStatus", CreateConnectedHeadsetStatus("com.Viscereality.SussexExperiment") with
@@ -651,11 +651,27 @@ public sealed class StudyShellWorkflowGuideRegressionTests
 
         var gate = InvokePrivateMethod<WorkflowGuideGateState>(viewModel, "BuildWifiMatchWorkflowGuideGateState");
 
+        Assert.False(gate.Ready);
+        Assert.Equal(OperationOutcomeKind.Warning, gate.Level);
+        Assert.Contains("NFTulpa", gate.Summary, StringComparison.Ordinal);
+        Assert.Contains("NFTulpa", gate.Detail, StringComparison.Ordinal);
+        Assert.Contains("Refresh the headset snapshot", gate.Detail, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void WifiMatchGate_Passes_WhenHeadsetAndPcReportRequiredWifi()
+    {
+        var viewModel = CreateViewModel(CreateStudy());
+        SetPrivateField(viewModel, "_headsetStatus", CreateConnectedHeadsetStatus("com.Viscereality.SussexExperiment"));
+        SetPrivateField(viewModel, "_headsetWifiSummary", "Headset Wi-Fi: NFTulpa");
+        SetPrivateField(viewModel, "_hostWifiSummary", "This PC Wi-Fi: NFTulpa");
+
+        var gate = InvokePrivateMethod<WorkflowGuideGateState>(viewModel, "BuildWifiMatchWorkflowGuideGateState");
+
         Assert.True(gate.Ready);
         Assert.Equal(OperationOutcomeKind.Success, gate.Level);
-        Assert.Equal("Quest router path is valid.", gate.Summary);
-        Assert.Contains("not required", gate.Detail, StringComparison.OrdinalIgnoreCase);
-        Assert.DoesNotContain("Refresh the headset snapshot until both the headset Wi-Fi and the PC Wi-Fi names are visible", gate.Detail, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("NFTulpa", gate.Summary, StringComparison.Ordinal);
+        Assert.Contains("NFTulpa", gate.Detail, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -970,9 +986,9 @@ public sealed class StudyShellWorkflowGuideRegressionTests
             Summary: "Connected.",
             Detail: "Connected over Wi-Fi ADB.",
             IsWifiAdbTransport: true,
-            HeadsetWifiSsid: "SussexLab",
+            HeadsetWifiSsid: "NFTulpa",
             HeadsetWifiIpAddress: "192.168.0.55",
-            HostWifiSsid: "SussexLab",
+            HostWifiSsid: "NFTulpa",
             WifiSsidMatchesHost: true);
 
     private static T InvokePrivateMethod<T>(object target, string methodName, params object[] args)

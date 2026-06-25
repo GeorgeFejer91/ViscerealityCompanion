@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -51,15 +52,26 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
     private const string TwinStateStreamType = "quest.twin.state";
     private const string TwinConfigStreamName = "quest_hotload_config";
     private const string TwinConfigStreamType = "quest.config";
+    private const string PeripersonalRuntimeStateStreamType = "peripersonal.runtime.state";
+    private const string RequiredExperimentWifiSsidDeviceProfileKey = "viscereality.required_wifi_ssid";
+    private const string RequiredExperimentWifiSsidValue = "NFTulpa";
     private const string PeripersonalStudyId = "peripersonal-space";
     private const string PeripersonalDefaultSessionId = "session-001";
     private const string PeripersonalBlockOneId = "block-1";
+    private const int PeripersonalParticipantNumberMinimum = 1;
+    private const int PeripersonalParticipantNumberMaximum = 999;
     private const string ControllerCalibrationModeHotloadKey = "study_controller_breathing_use_principal_axis_calibration";
     private const string ParticipantSessionReviewPdfFileName = "session_review_report.pdf";
     private static readonly TimeSpan WorkflowClockAlignmentSparseProbeDuration = TimeSpan.FromSeconds(2.5);
     private static readonly TimeSpan WorkflowClockAlignmentRunSafetyMargin = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan WorkflowClockAlignmentStopTimeout = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan WorkflowUpstreamMonitorStopTimeout = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan PeripersonalHeadsetEventMonitorStopTimeout = TimeSpan.FromSeconds(4);
+    private static readonly TimeSpan PeripersonalUnityHttpStatusPollInterval = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan PeripersonalUnityHttpStatusTimeout = TimeSpan.FromSeconds(1.2);
+    private static readonly TimeSpan PeripersonalQuestResultFilePollInterval = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan PeripersonalQuestResultFileReadTimeout = TimeSpan.FromSeconds(2);
+    private static readonly Uri PeripersonalUnityHttpStatusUri = new("http://127.0.0.1:8787/v1/status");
     private static readonly TimeSpan ControllerCalibrationModeConfirmationTimeout = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan ControllerCalibrationModeConfirmationPollInterval = TimeSpan.FromMilliseconds(150);
     private static readonly TimeSpan WorkflowValidationPdfTimeout = TimeSpan.FromSeconds(45);
@@ -309,17 +321,24 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
     private string _workflowRuntimePendingDetail =
         "The current Sussex runtime contract includes reset calibration, participant start/end commands, shared session metadata handoff, and mirrored Windows/Quest study recording.";
     private string _participantIdDraft = string.Empty;
+    private int _peripersonalParticipantNumberValue = PeripersonalParticipantNumberMinimum;
+    private string _peripersonalParticipantNameDraft = string.Empty;
+    private string _peripersonalParticipantAgeDraft = string.Empty;
     private string _peripersonalSessionIdDraft = PeripersonalDefaultSessionId;
     private string _peripersonalHandednessDraft = "right-handed";
     private string _peripersonalLanguageCodeDraft = "en";
     private string _peripersonalXrBlockIdDraft = "xr-block-1";
     private OperationOutcomeKind _peripersonalWorkflowLevel = OperationOutcomeKind.Preview;
-    private string _peripersonalWorkflowSummary = "Prepare the peripersonal session before opening Questionnaire Block 1.";
-    private string _peripersonalWorkflowDetail = "George's workflow uses one global recording after Questionnaire Block 1 and a final Stop Recording at the end of the experiment.";
+    private string _peripersonalWorkflowSummary = "Enter participant metadata before starting the experiment recording.";
+    private string _peripersonalWorkflowDetail = "The peripersonal workflow uses one global recording that starts after metadata/session preparation, with questionnaire blocks logged inside that recording.";
     private string _peripersonalSessionFolderLabel = "No peripersonal session prepared.";
     private string _peripersonalLedgerPath = string.Empty;
     private bool _peripersonalQuestionnaireBlockOneSubmitted;
+    private bool _peripersonalQuestionnaireBlockTwoSubmitted;
+    private bool _peripersonalQuestionnaireBlockThreeSubmitted;
+    private string _peripersonalVisibleQuestionnaireBlock = string.Empty;
     private bool? _peripersonalParticlesVisible;
+    private bool? _peripersonalPendingParticlesVisible;
     private PeripersonalOperatorWorkflowService? _peripersonalWorkflow;
     private PeripersonalLslCommandTransport? _peripersonalLslCommandTransport;
     private OperationOutcomeKind _participantEntryLevel = OperationOutcomeKind.Preview;
@@ -347,6 +366,13 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
     private bool _participantRunStopping;
     private string _recorderFaultDetail = string.Empty;
     private StudyDataRecordingSession? _activeRecordingSession;
+    private readonly ILslMonitorService _peripersonalHeadsetEventMonitorService = LslMonitorServiceFactory.CreateDefault();
+    private readonly ILslMonitorService _peripersonalRuntimeStateMonitorService = LslMonitorServiceFactory.CreateDefault();
+    private CancellationTokenSource? _peripersonalHeadsetEventMonitorCts;
+    private Task? _peripersonalHeadsetEventMonitorTask;
+    private string _lastPeripersonalHeadsetEventSignature = string.Empty;
+    private readonly object _peripersonalQuestQuestionnaireResultLock = new();
+    private readonly HashSet<string> _seenPeripersonalQuestQuestionnaireResultSignatures = new(StringComparer.Ordinal);
     private CancellationTokenSource? _upstreamLslMonitorCts;
     private Task? _upstreamLslMonitorTask;
     private CancellationTokenSource? _backgroundClockAlignmentCts;
@@ -444,6 +470,11 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
     {
         _study = study;
         _isPeripersonalWorkflow = string.Equals(study.Id, PeripersonalStudyId, StringComparison.OrdinalIgnoreCase);
+        if (_isPeripersonalWorkflow)
+        {
+            _participantIdDraft = FormatPeripersonalParticipantNumber(_peripersonalParticipantNumberValue);
+        }
+
         _dispatcher = Application.Current?.Dispatcher ?? Dispatcher.CurrentDispatcher;
         var loadedSessionState = AppSessionState.Load();
         _appSessionState = NormalizeStartupSessionState(loadedSessionState, out var clearedPersistedRegularSnapshots);
@@ -544,11 +575,22 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
         ResetBreathingCalibrationCommand = new AsyncRelayCommand(ResetBreathingCalibrationAsync);
         ToggleAutomaticBreathingModeCommand = new AsyncRelayCommand(ToggleAutomaticBreathingModeAsync);
         ToggleAutomaticBreathingRunCommand = new AsyncRelayCommand(ToggleAutomaticBreathingRunAsync);
+        DecreasePeripersonalParticipantNumberCommand = new AsyncRelayCommand(DecreasePeripersonalParticipantNumberAsync, () => CanDecreasePeripersonalParticipantNumber);
+        IncreasePeripersonalParticipantNumberCommand = new AsyncRelayCommand(IncreasePeripersonalParticipantNumberAsync, () => CanIncreasePeripersonalParticipantNumber);
         PreparePeripersonalSessionCommand = new AsyncRelayCommand(PreparePeripersonalSessionAsync, () => CanPreparePeripersonalSession);
         OpenPeripersonalQuestionnaireBlock1Command = new AsyncRelayCommand(() => OpenPeripersonalQuestionnaireBlockAsync(PeripersonalBlockOneId, 1), () => CanOpenPeripersonalQuestionnaireBlock1);
         OpenPeripersonalQuestionnaireBlock2Command = new AsyncRelayCommand(() => OpenPeripersonalQuestionnaireBlockAsync("block-2", 2), () => CanOpenPeripersonalQuestionnaireBlock2);
         OpenPeripersonalQuestionnaireBlock3Command = new AsyncRelayCommand(() => OpenPeripersonalQuestionnaireBlockAsync("block-3", 3), () => CanOpenPeripersonalQuestionnaireBlock3);
         MarkPeripersonalBlock1SubmittedCommand = new AsyncRelayCommand(MarkPeripersonalBlock1SubmittedAsync, () => CanMarkPeripersonalBlock1Submitted);
+        ShowPeripersonalBlock1Command = new AsyncRelayCommand(() => OpenPeripersonalQuestionnaireBlockAsync(PeripersonalBlockOneId, 1), () => CanShowPeripersonalBlock1);
+        ShowPeripersonalBlock2Command = new AsyncRelayCommand(() => OpenPeripersonalQuestionnaireBlockAsync("block-2", 2), () => CanShowPeripersonalBlock2);
+        ShowPeripersonalBlock3Command = new AsyncRelayCommand(() => OpenPeripersonalQuestionnaireBlockAsync("block-3", 3), () => CanShowPeripersonalBlock3);
+        FinishPeripersonalBlock1Command = new AsyncRelayCommand(() => FinishPeripersonalQuestionnaireBlockAsync(PeripersonalBlockOneId), () => CanFinishPeripersonalBlock1);
+        FinishPeripersonalBlock2Command = new AsyncRelayCommand(() => FinishPeripersonalQuestionnaireBlockAsync("block-2"), () => CanFinishPeripersonalBlock2);
+        FinishPeripersonalBlock3Command = new AsyncRelayCommand(() => FinishPeripersonalQuestionnaireBlockAsync("block-3"), () => CanFinishPeripersonalBlock3);
+        TogglePeripersonalBlock1Command = new AsyncRelayCommand(() => TogglePeripersonalQuestionnaireBlockAsync(PeripersonalBlockOneId, 1), () => CanTogglePeripersonalBlock1);
+        TogglePeripersonalBlock2Command = new AsyncRelayCommand(() => TogglePeripersonalQuestionnaireBlockAsync("block-2", 2), () => CanTogglePeripersonalBlock2);
+        TogglePeripersonalBlock3Command = new AsyncRelayCommand(() => TogglePeripersonalQuestionnaireBlockAsync("block-3", 3), () => CanTogglePeripersonalBlock3);
         MarkPeripersonalXrBlockEndCommand = new AsyncRelayCommand(MarkPeripersonalXrBlockEndAsync, () => CanMarkPeripersonalXrBlockEnd);
         RunPeripersonalClockProbeCommand = new AsyncRelayCommand(RunPeripersonalClockProbeAsync, () => CanRunPeripersonalClockProbe);
         StartExperimentCommand = new AsyncRelayCommand(StartExperimentAsync);
@@ -587,6 +629,7 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
     public string StudyId => _study.Id;
     public string StudyPartner => _study.Partner;
     public string StudyDescription => _study.Description;
+    public string RequiredExperimentWifiSsid => RequiredExperimentWifiSsidValue;
     public string PinnedPackageId => _study.App.PackageId;
     public string PublishedBuildSummary => AppBuildIdentity.Current.Summary;
     public string PublishedBuildDetail => AppBuildIdentity.Current.Detail;
@@ -676,6 +719,15 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
                 OpenPeripersonalQuestionnaireBlock2Command,
                 OpenPeripersonalQuestionnaireBlock3Command,
                 MarkPeripersonalBlock1SubmittedCommand,
+                ShowPeripersonalBlock1Command,
+                ShowPeripersonalBlock2Command,
+                ShowPeripersonalBlock3Command,
+                FinishPeripersonalBlock1Command,
+                FinishPeripersonalBlock2Command,
+                FinishPeripersonalBlock3Command,
+                TogglePeripersonalBlock1Command,
+                TogglePeripersonalBlock2Command,
+                TogglePeripersonalBlock3Command,
                 MarkPeripersonalXrBlockEndCommand,
                 RunPeripersonalClockProbeCommand,
                 StartExperimentCommand,
@@ -1203,7 +1255,9 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
         {
             if (SetProperty(ref _participantIdDraft, value))
             {
+                SynchronizePeripersonalParticipantNumberValue(value);
                 UpdateParticipantSessionState();
+                RefreshPeripersonalWorkflowProperties();
                 RefreshBenchToolsStatus();
                 UpdateWorkflowGuideState();
             }
@@ -1212,6 +1266,64 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
 
     public bool IsPeripersonalWorkflow => _isPeripersonalWorkflow;
 
+    public string PeripersonalPreparationFilePath
+        => NormalizeHostVisibleOperatorPath(PeripersonalSessionPreparationState.StatePath);
+
+    public string PeripersonalParticipantNumberDisplay
+        => FormatPeripersonalParticipantNumber(_peripersonalParticipantNumberValue);
+
+    public bool CanDecreasePeripersonalParticipantNumber
+        => _isPeripersonalWorkflow && _peripersonalParticipantNumberValue > PeripersonalParticipantNumberMinimum;
+
+    public bool CanIncreasePeripersonalParticipantNumber
+        => _isPeripersonalWorkflow && _peripersonalParticipantNumberValue < PeripersonalParticipantNumberMaximum;
+
+    public string PeripersonalParticipantNameDraft
+    {
+        get => _peripersonalParticipantNameDraft;
+        set
+        {
+            if (SetProperty(ref _peripersonalParticipantNameDraft, value))
+            {
+                UpdateParticipantSessionState();
+                RefreshPeripersonalWorkflowProperties();
+            }
+        }
+    }
+
+    public string PeripersonalParticipantAgeDraft
+    {
+        get => _peripersonalParticipantAgeDraft;
+        set
+        {
+            if (SetProperty(ref _peripersonalParticipantAgeDraft, value))
+            {
+                UpdateParticipantSessionState();
+                RefreshPeripersonalWorkflowProperties();
+            }
+        }
+    }
+
+    public string PeripersonalSessionParticipantSummary
+    {
+        get
+        {
+            var participantName = string.IsNullOrWhiteSpace(PeripersonalParticipantNameDraft)
+                ? "name n/a"
+                : PeripersonalParticipantNameDraft.Trim();
+            var participantNumber = string.IsNullOrWhiteSpace(ParticipantIdDraft)
+                ? "number n/a"
+                : ParticipantIdDraft.Trim();
+            var age = string.IsNullOrWhiteSpace(PeripersonalParticipantAgeDraft)
+                ? "age n/a"
+                : $"age {PeripersonalParticipantAgeDraft.Trim()}";
+            var handedness = string.IsNullOrWhiteSpace(PeripersonalHandednessDraft)
+                ? "handedness n/a"
+                : PeripersonalHandednessDraft.Trim();
+            return $"{participantName} | participant {participantNumber} | {age} | {handedness}";
+        }
+    }
+
     public string PeripersonalSessionIdDraft
     {
         get => _peripersonalSessionIdDraft;
@@ -1219,6 +1331,7 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
         {
             if (SetProperty(ref _peripersonalSessionIdDraft, value))
             {
+                UpdateParticipantSessionState();
                 RefreshPeripersonalWorkflowProperties();
             }
         }
@@ -1232,6 +1345,7 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
             if (SetProperty(ref _peripersonalHandednessDraft, value))
             {
                 OnPropertyChanged(nameof(PeripersonalBreathControllerSideLabel));
+                UpdateParticipantSessionState();
                 RefreshPeripersonalWorkflowProperties();
             }
         }
@@ -2413,12 +2527,23 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
     public bool CanPreparePeripersonalSession
         => _isPeripersonalWorkflow
             && (_peripersonalWorkflow is null || _peripersonalWorkflow.State is PeripersonalOperatorWorkflowState.Idle or PeripersonalOperatorWorkflowState.Stopped)
-            && !string.IsNullOrWhiteSpace(ParticipantIdDraft)
+            && IsValidPeripersonalParticipantNumber(ParticipantIdDraft)
+            && !string.IsNullOrWhiteSpace(PeripersonalParticipantNameDraft)
             && !string.IsNullOrWhiteSpace(PeripersonalSessionIdDraft)
             && !string.IsNullOrWhiteSpace(PeripersonalOperatorWorkflowService.BreathTrackingControllerFromHandedness(PeripersonalHandednessDraft))
             && !string.IsNullOrWhiteSpace(PeripersonalLanguageCodeDraft)
             && !string.IsNullOrWhiteSpace(ResolveHeadsetActionSelector())
+            && IsRequiredExperimentWifiReady()
             && IsStudyRuntimeForeground();
+
+    public bool CanSavePeripersonalSessionPreparation
+        => _isPeripersonalWorkflow
+            && IsValidPeripersonalParticipantNumber(ParticipantIdDraft)
+            && !string.IsNullOrWhiteSpace(PeripersonalParticipantNameDraft)
+            && !string.IsNullOrWhiteSpace(PeripersonalParticipantAgeDraft)
+            && !string.IsNullOrWhiteSpace(PeripersonalSessionIdDraft)
+            && !string.IsNullOrWhiteSpace(PeripersonalOperatorWorkflowService.BreathTrackingControllerFromHandedness(PeripersonalHandednessDraft))
+            && !string.IsNullOrWhiteSpace(PeripersonalLanguageCodeDraft);
 
     public bool CanOpenPeripersonalQuestionnaireBlock1
         => _isPeripersonalWorkflow
@@ -2426,13 +2551,65 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
 
     public bool CanOpenPeripersonalQuestionnaireBlock2
         => _isPeripersonalWorkflow
-            && PeripersonalQuestionnaireBlockOneSubmitted
             && _peripersonalWorkflow?.State == PeripersonalOperatorWorkflowState.Recording;
 
     public bool CanOpenPeripersonalQuestionnaireBlock3
         => _isPeripersonalWorkflow
-            && PeripersonalQuestionnaireBlockOneSubmitted
             && _peripersonalWorkflow?.State == PeripersonalOperatorWorkflowState.Recording;
+
+    public bool CanShowPeripersonalBlock1
+        => CanOpenPeripersonalQuestionnaireBlock1 && !IsPeripersonalQuestionnaireBlockVisible(PeripersonalBlockOneId);
+
+    public bool CanShowPeripersonalBlock2
+        => CanOpenPeripersonalQuestionnaireBlock2 && !IsPeripersonalQuestionnaireBlockVisible("block-2");
+
+    public bool CanShowPeripersonalBlock3
+        => CanOpenPeripersonalQuestionnaireBlock3 && !IsPeripersonalQuestionnaireBlockVisible("block-3");
+
+    public bool CanFinishPeripersonalBlock1
+        => IsPeripersonalQuestionnaireBlockVisible(PeripersonalBlockOneId);
+
+    public bool CanFinishPeripersonalBlock2
+        => IsPeripersonalQuestionnaireBlockVisible("block-2");
+
+    public bool CanFinishPeripersonalBlock3
+        => IsPeripersonalQuestionnaireBlockVisible("block-3");
+
+    public bool IsPeripersonalBlock1Active
+        => IsPeripersonalQuestionnaireBlockVisible(PeripersonalBlockOneId);
+
+    public bool IsPeripersonalBlock2Active
+        => IsPeripersonalQuestionnaireBlockVisible("block-2");
+
+    public bool IsPeripersonalBlock3Active
+        => IsPeripersonalQuestionnaireBlockVisible("block-3");
+
+    public bool CanTogglePeripersonalBlock1
+        => CanShowPeripersonalBlock1 || CanFinishPeripersonalBlock1;
+
+    public bool CanTogglePeripersonalBlock2
+        => CanShowPeripersonalBlock2 || CanFinishPeripersonalBlock2;
+
+    public bool CanTogglePeripersonalBlock3
+        => CanShowPeripersonalBlock3 || CanFinishPeripersonalBlock3;
+
+    public OperationOutcomeKind PeripersonalBlock1Level
+        => GetPeripersonalBlockLevel(PeripersonalBlockOneId, PeripersonalQuestionnaireBlockOneSubmitted, CanOpenPeripersonalQuestionnaireBlock1);
+
+    public OperationOutcomeKind PeripersonalBlock2Level
+        => GetPeripersonalBlockLevel("block-2", _peripersonalQuestionnaireBlockTwoSubmitted, CanOpenPeripersonalQuestionnaireBlock2);
+
+    public OperationOutcomeKind PeripersonalBlock3Level
+        => GetPeripersonalBlockLevel("block-3", _peripersonalQuestionnaireBlockThreeSubmitted, CanOpenPeripersonalQuestionnaireBlock3);
+
+    public string PeripersonalBlock1Summary
+        => GetPeripersonalBlockSummary(PeripersonalBlockOneId, PeripersonalQuestionnaireBlockOneSubmitted, CanOpenPeripersonalQuestionnaireBlock1);
+
+    public string PeripersonalBlock2Summary
+        => GetPeripersonalBlockSummary("block-2", _peripersonalQuestionnaireBlockTwoSubmitted, CanOpenPeripersonalQuestionnaireBlock2);
+
+    public string PeripersonalBlock3Summary
+        => GetPeripersonalBlockSummary("block-3", _peripersonalQuestionnaireBlockThreeSubmitted, CanOpenPeripersonalQuestionnaireBlock3);
 
     public bool CanMarkPeripersonalBlock1Submitted
         => _isPeripersonalWorkflow
@@ -2529,7 +2706,6 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
         => _isPeripersonalWorkflow
             ? CanStartExperiment
               && IsStudyRuntimeForeground()
-              && PeripersonalQuestionnaireBlockOneSubmitted
               && _peripersonalWorkflow?.State == PeripersonalOperatorWorkflowState.Prepared
               && !_participantRunStopping
               && !ClockAlignmentRunning
@@ -2694,11 +2870,22 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
     public AsyncRelayCommand ResetBreathingCalibrationCommand { get; }
     public AsyncRelayCommand ToggleAutomaticBreathingModeCommand { get; }
     public AsyncRelayCommand ToggleAutomaticBreathingRunCommand { get; }
+    public AsyncRelayCommand DecreasePeripersonalParticipantNumberCommand { get; }
+    public AsyncRelayCommand IncreasePeripersonalParticipantNumberCommand { get; }
     public AsyncRelayCommand PreparePeripersonalSessionCommand { get; }
     public AsyncRelayCommand OpenPeripersonalQuestionnaireBlock1Command { get; }
     public AsyncRelayCommand OpenPeripersonalQuestionnaireBlock2Command { get; }
     public AsyncRelayCommand OpenPeripersonalQuestionnaireBlock3Command { get; }
     public AsyncRelayCommand MarkPeripersonalBlock1SubmittedCommand { get; }
+    public AsyncRelayCommand ShowPeripersonalBlock1Command { get; }
+    public AsyncRelayCommand ShowPeripersonalBlock2Command { get; }
+    public AsyncRelayCommand ShowPeripersonalBlock3Command { get; }
+    public AsyncRelayCommand FinishPeripersonalBlock1Command { get; }
+    public AsyncRelayCommand FinishPeripersonalBlock2Command { get; }
+    public AsyncRelayCommand FinishPeripersonalBlock3Command { get; }
+    public AsyncRelayCommand TogglePeripersonalBlock1Command { get; }
+    public AsyncRelayCommand TogglePeripersonalBlock2Command { get; }
+    public AsyncRelayCommand TogglePeripersonalBlock3Command { get; }
     public AsyncRelayCommand MarkPeripersonalXrBlockEndCommand { get; }
     public AsyncRelayCommand RunPeripersonalClockProbeCommand { get; }
     public AsyncRelayCommand StartExperimentCommand { get; }
@@ -2751,6 +2938,7 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
     public void Dispose()
     {
         CancelExperimentTimingTasks();
+        StopPeripersonalHeadsetEventMonitorAsync().GetAwaiter().GetResult();
 
         if (_twinBridge is LslTwinModeBridge lslBridge)
         {
@@ -4021,10 +4209,16 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
             .ConfigureAwait(false);
 
         await ApplyOutcomeAsync(
-            "Launch Sussex Runtime",
+            $"Launch {_study.Label} Runtime",
             outcome).ConfigureAwait(false);
         if (outcome.Kind != OperationOutcomeKind.Failure)
         {
+            var bridgeForwardOutcome = await EnsurePeripersonalUnityHttpBridgeForwardAsync().ConfigureAwait(false);
+            if (bridgeForwardOutcome is not null)
+            {
+                await ApplyOutcomeAsync("Forward Unity HTTP Bridge", bridgeForwardOutcome).ConfigureAwait(false);
+            }
+
             await DispatchAsync(() =>
             {
                 var selector = ResolveHeadsetActionSelector();
@@ -4099,10 +4293,10 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
             {
                 if (!string.Equals(_headsetStatus?.ForegroundPackageId, _study.App.PackageId, StringComparison.OrdinalIgnoreCase))
                 {
-                    AppendLog(
-                        OperatorLogLevel.Warning,
-                        "Launch command sent, but Sussex is not active.",
-                        $"Active app is {_headsetStatus?.ForegroundPackageId ?? "unknown"}. The headset may be in Guardian, lockscreen, or the Meta shell instead of the study runtime.");
+                        AppendLog(
+                            OperatorLogLevel.Warning,
+                            $"Launch command sent, but {_study.Label} is not active.",
+                            $"Active app is {_headsetStatus?.ForegroundPackageId ?? "unknown"}. The headset may be in Guardian, lockscreen, or the Meta shell instead of the study runtime.");
                 }
             }).ConfigureAwait(false);
         }
@@ -4118,7 +4312,7 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
             .ConfigureAwait(false);
 
         await ApplyOutcomeAsync(
-            "Stop Sussex Runtime",
+            $"Stop {_study.Label} Runtime",
             outcome).ConfigureAwait(false);
 
         if (outcome.Kind != OperationOutcomeKind.Failure)
@@ -5303,19 +5497,24 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
         if (!CanPreparePeripersonalSession)
         {
             await ApplyOutcomeAsync(
-                ActionLabel,
-                new OperationOutcome(
-                    OperationOutcomeKind.Warning,
-                    "Peripersonal session is not ready to prepare.",
-                    "Enter participant id, session id, handedness, select a Quest endpoint, and launch the Unity runtime before preparing the session.")).ConfigureAwait(false);
+                    ActionLabel,
+                    new OperationOutcome(
+                        OperationOutcomeKind.Warning,
+                        "Peripersonal session is not ready to prepare.",
+                        "Enter participant number, participant name, session id, handedness, select a Quest endpoint, and launch the Unity runtime before preparing the session.")).ConfigureAwait(false);
             return;
         }
 
         if (_peripersonalWorkflow?.State == PeripersonalOperatorWorkflowState.Stopped)
         {
+            await StopPeripersonalHeadsetEventMonitorAsync().ConfigureAwait(false);
             _peripersonalWorkflow = null;
             _peripersonalQuestionnaireBlockOneSubmitted = false;
+            _peripersonalQuestionnaireBlockTwoSubmitted = false;
+            _peripersonalQuestionnaireBlockThreeSubmitted = false;
+            _peripersonalVisibleQuestionnaireBlock = string.Empty;
             _peripersonalParticlesVisible = null;
+            _peripersonalPendingParticlesVisible = null;
         }
 
         var workflow = await EnsurePeripersonalWorkflowAsync(ActionLabel).ConfigureAwait(false);
@@ -5330,7 +5529,9 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
                 Handedness: PeripersonalHandednessDraft.Trim(),
                 StudyId: _study.Id,
                 LanguageCode: PeripersonalLanguageCodeDraft.Trim(),
-                InitialConditionId: SelectedCondition?.Id ?? string.Empty))
+                InitialConditionId: SelectedCondition?.Id ?? string.Empty,
+                ParticipantName: PeripersonalParticipantNameDraft.Trim(),
+                ParticipantNumber: ParticipantIdDraft.Trim()))
             .ConfigureAwait(false);
         var result = await workflow.PrepareSessionAsync(request).ConfigureAwait(false);
         await ApplyPeripersonalWorkflowResultAsync(ActionLabel, result).ConfigureAwait(false);
@@ -5350,12 +5551,70 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
             return;
         }
 
+        var normalizedBlockId = NormalizePeripersonalBlockId(blockId);
+        await ApplyOutcomeAsync(
+            actionLabel,
+            new OperationOutcome(
+                OperationOutcomeKind.Warning,
+                $"Waiting for headset confirmation for {FormatPeripersonalBlockLabel(normalizedBlockId)}.",
+                "The switch stays in the last confirmed position until the headset acknowledges the questionnaire block command.")).ConfigureAwait(false);
+
         var result = await _peripersonalWorkflow.OpenQuestionnaireBlockAsync(
                 $"wpf-{blockId}-{DateTimeOffset.UtcNow:yyyyMMddHHmmssfff}",
                 blockId,
                 [blockId],
                 conditionNumber)
             .ConfigureAwait(false);
+        if (result.Succeeded)
+        {
+            await DispatchAsync(() => ApplyConfirmedPeripersonalQuestionnaireLaunch(normalizedBlockId))
+                .ConfigureAwait(false);
+        }
+
+        await ApplyPeripersonalWorkflowResultAsync(actionLabel, result).ConfigureAwait(false);
+    }
+
+    private Task TogglePeripersonalQuestionnaireBlockAsync(string blockId, int conditionNumber)
+    {
+        var normalizedBlockId = NormalizePeripersonalBlockId(blockId);
+        return IsPeripersonalQuestionnaireBlockVisible(normalizedBlockId)
+            ? ClosePeripersonalQuestionnaireBlockAsync(normalizedBlockId, conditionNumber)
+            : OpenPeripersonalQuestionnaireBlockAsync(normalizedBlockId, conditionNumber);
+    }
+
+    private async Task ClosePeripersonalQuestionnaireBlockAsync(string blockId, int conditionNumber)
+    {
+        var normalizedBlockId = NormalizePeripersonalBlockId(blockId);
+        var actionLabel = $"Close {FormatPeripersonalBlockLabel(normalizedBlockId)}";
+        if (!_isPeripersonalWorkflow || _peripersonalWorkflow is null)
+        {
+            await ApplyOutcomeAsync(
+                actionLabel,
+                new OperationOutcome(
+                    OperationOutcomeKind.Warning,
+                    "Questionnaire close is blocked.",
+                    "Prepare the peripersonal session before closing a questionnaire block.")).ConfigureAwait(false);
+            return;
+        }
+
+        await ApplyOutcomeAsync(
+            actionLabel,
+            new OperationOutcome(
+                OperationOutcomeKind.Warning,
+                $"Waiting for headset confirmation to hide {FormatPeripersonalBlockLabel(normalizedBlockId)}.",
+                "The switch stays in the last confirmed position until the headset acknowledges the close request or publishes a completion signal.")).ConfigureAwait(false);
+
+        var result = await _peripersonalWorkflow.CloseQuestionnaireBlockAsync(
+                $"wpf-close-{normalizedBlockId}-{DateTimeOffset.UtcNow:yyyyMMddHHmmssfff}",
+                normalizedBlockId,
+                conditionNumber)
+            .ConfigureAwait(false);
+        if (result.Succeeded)
+        {
+            await DispatchAsync(() => ApplyConfirmedPeripersonalQuestionnaireClose(normalizedBlockId))
+                .ConfigureAwait(false);
+        }
+
         await ApplyPeripersonalWorkflowResultAsync(actionLabel, result).ConfigureAwait(false);
     }
 
@@ -5377,9 +5636,60 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
         if (result.Succeeded)
         {
             PeripersonalQuestionnaireBlockOneSubmitted = true;
+            if (IsPeripersonalQuestionnaireBlockVisible(PeripersonalBlockOneId))
+            {
+                _peripersonalVisibleQuestionnaireBlock = string.Empty;
+            }
+
+            RefreshPeripersonalRunnerBlockProperties();
         }
 
         await ApplyPeripersonalWorkflowResultAsync(ActionLabel, result).ConfigureAwait(false);
+    }
+
+    private async Task FinishPeripersonalQuestionnaireBlockAsync(string blockId)
+    {
+        var normalizedBlockId = NormalizePeripersonalBlockId(blockId);
+        var actionLabel = $"Mark {FormatPeripersonalBlockLabel(normalizedBlockId)} Finished";
+        if (!_isPeripersonalWorkflow || _peripersonalWorkflow is null)
+        {
+            await ApplyOutcomeAsync(
+                actionLabel,
+                new OperationOutcome(
+                    OperationOutcomeKind.Warning,
+                    "Questionnaire block cannot be marked yet.",
+                    "Start the session before marking a block finished.")).ConfigureAwait(false);
+            return;
+        }
+
+        var result = _peripersonalWorkflow.RecordQuestionnaireSubmitted(normalizedBlockId);
+        if (result.Succeeded)
+        {
+            await DispatchAsync(() =>
+            {
+                if (string.Equals(normalizedBlockId, PeripersonalBlockOneId, StringComparison.OrdinalIgnoreCase))
+                {
+                    PeripersonalQuestionnaireBlockOneSubmitted = true;
+                }
+                else if (string.Equals(normalizedBlockId, "block-2", StringComparison.OrdinalIgnoreCase))
+                {
+                    _peripersonalQuestionnaireBlockTwoSubmitted = true;
+                }
+                else if (string.Equals(normalizedBlockId, "block-3", StringComparison.OrdinalIgnoreCase))
+                {
+                    _peripersonalQuestionnaireBlockThreeSubmitted = true;
+                }
+
+                if (IsPeripersonalQuestionnaireBlockVisible(normalizedBlockId))
+                {
+                    _peripersonalVisibleQuestionnaireBlock = string.Empty;
+                }
+
+                RefreshPeripersonalRunnerBlockProperties();
+            }).ConfigureAwait(false);
+        }
+
+        await ApplyPeripersonalWorkflowResultAsync(actionLabel, result).ConfigureAwait(false);
     }
 
     private async Task MarkPeripersonalXrBlockEndAsync()
@@ -5398,13 +5708,87 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
 
     private async Task StartPeripersonalRecordingAsync()
     {
-        const string ActionLabel = "Start Recording";
-        if (!_isPeripersonalWorkflow || _peripersonalWorkflow is null)
+        const string ActionLabel = "Start Experiment";
+        if (!_isPeripersonalWorkflow)
         {
             return;
         }
 
-        var result = await _peripersonalWorkflow.StartRecordingAsync().ConfigureAwait(false);
+        await RefreshStatusAsync().ConfigureAwait(false);
+
+        if (_peripersonalWorkflow is null || _peripersonalWorkflow.State is PeripersonalOperatorWorkflowState.Idle or PeripersonalOperatorWorkflowState.Stopped)
+        {
+            if (!CanSavePeripersonalSessionPreparation)
+            {
+                await ApplyOutcomeAsync(
+                    ActionLabel,
+                    new OperationOutcome(
+                        OperationOutcomeKind.Warning,
+                        "Participant setup is incomplete.",
+                        "Enter participant name, participant number, age, session id, handedness, and language before starting the experiment.")).ConfigureAwait(false);
+                return;
+            }
+
+            if (!IsRequiredExperimentWifiReady())
+            {
+                await ApplyOutcomeAsync(
+                    ActionLabel,
+                    new OperationOutcome(
+                        OperationOutcomeKind.Warning,
+                        $"Connect both devices to {RequiredExperimentWifiSsid}.",
+                        BuildRequiredExperimentWifiDetail(_headsetStatus))).ConfigureAwait(false);
+                return;
+            }
+
+            if (!IsStudyRuntimeForeground())
+            {
+                await ApplyOutcomeAsync(
+                    ActionLabel,
+                    new OperationOutcome(
+                        OperationOutcomeKind.Preview,
+                        "Launching the Peripersonal XR runtime.",
+                        "Start Experiment launches Unity first, then prepares metadata, starts recording, forces particles off, and opens Block 1.")).ConfigureAwait(false);
+                await LaunchStudyAppAsync().ConfigureAwait(false);
+                await RefreshStatusAsync().ConfigureAwait(false);
+            }
+
+            if (!IsStudyRuntimeForeground())
+            {
+                await ApplyOutcomeAsync(
+                    ActionLabel,
+                    new OperationOutcome(
+                        OperationOutcomeKind.Warning,
+                        "Peripersonal XR runtime is not foregrounded.",
+                        "Start Experiment tried to launch Unity, but the headset did not report the Peripersonal runtime in the foreground yet. Check the headset for a launch prompt, lock screen, or Meta shell dialog.")).ConfigureAwait(false);
+                return;
+            }
+
+            await PreparePeripersonalSessionAsync().ConfigureAwait(false);
+        }
+
+        if (_peripersonalWorkflow?.State != PeripersonalOperatorWorkflowState.Prepared)
+        {
+            await ApplyOutcomeAsync(
+                ActionLabel,
+                new OperationOutcome(
+                    OperationOutcomeKind.Warning,
+                    "Session is not ready to record.",
+                    "Start Experiment first prepares the live session. Check the status message above for the blocking setup item.")).ConfigureAwait(false);
+            return;
+        }
+
+        var result = await _peripersonalWorkflow.StartExperimentAndOpenBlockOneAsync().ConfigureAwait(false);
+        if (result.Succeeded)
+        {
+            await DispatchAsync(() =>
+            {
+                _peripersonalParticlesVisible = false;
+                _peripersonalPendingParticlesVisible = null;
+                _peripersonalVisibleQuestionnaireBlock = NormalizePeripersonalBlockId(PeripersonalBlockOneId);
+                RefreshPeripersonalRunnerProperties();
+            }).ConfigureAwait(false);
+        }
+
         await ApplyPeripersonalWorkflowResultAsync(ActionLabel, result).ConfigureAwait(false);
     }
 
@@ -5484,6 +5868,7 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
         }).ConfigureAwait(false);
 
         var result = await _peripersonalWorkflow.StopRecordingAndCloseAppsAsync().ConfigureAwait(false);
+        await StopPeripersonalHeadsetEventMonitorAsync().ConfigureAwait(false);
         await DispatchAsync(() =>
         {
             _participantRunStopping = false;
@@ -6786,7 +7171,7 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
         => SendStudyTwinCommandAsync(_study.Controls.RecenterCommandActionId, "Recenter");
 
     private Task ToggleParticlesAsync()
-        => GetCurrentReportedParticleVisibility() == true
+        => IsParticlesToggleState == true
             ? !CanToggleParticles
                 ? Task.CompletedTask
                 : ParticlesOffAsync()
@@ -6846,20 +7231,32 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
             return;
         }
 
+        await ApplyOutcomeAsync(
+            actionLabel,
+            new OperationOutcome(
+                OperationOutcomeKind.Warning,
+                $"Waiting for headset confirmation: {actionLabel}.",
+                "The particle switch stays in the last confirmed position until the headset reports that the visibility command took effect.")).ConfigureAwait(false);
+        await DispatchAsync(() =>
+        {
+            _peripersonalPendingParticlesVisible = visible;
+            UpdatePeripersonalParticlesCard();
+            RefreshPeripersonalRunnerProperties();
+        }).ConfigureAwait(false);
+
         var result = await _peripersonalWorkflow.SetParticlesVisibleAsync(visible).ConfigureAwait(false);
         if (result.Succeeded)
         {
+            await DispatchAsync(() => ApplyConfirmedPeripersonalParticleVisibility(visible))
+                .ConfigureAwait(false);
+        }
+        else
+        {
             await DispatchAsync(() =>
             {
-                _peripersonalParticlesVisible = visible;
-                if (visible)
-                {
-                    _workflowGuideParticlesOnVerified = true;
-                }
-                else
-                {
-                    _workflowGuideParticlesOffVerified = true;
-                }
+                _peripersonalPendingParticlesVisible = null;
+                UpdatePeripersonalParticlesCard();
+                RefreshPeripersonalRunnerProperties();
             }).ConfigureAwait(false);
         }
 
@@ -6905,8 +7302,40 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
             _study,
             new PeripersonalCompositeCommandTransport(_peripersonalLslCommandTransport, panelTransport),
             questAppCloser: new PeripersonalAdbQuestAppCloser(adbPath, selector),
-            questBackupPuller: new PeripersonalAdbQuestBackupPuller(adbPath, selector));
+            questBackupPuller: new PeripersonalAdbQuestBackupPuller(adbPath, selector),
+            questHttpForwarder: new PeripersonalAdbQuestHttpForwarder(adbPath, selector));
+        StartPeripersonalHeadsetEventMonitor();
         return _peripersonalWorkflow;
+    }
+
+    private async Task<OperationOutcome?> EnsurePeripersonalUnityHttpBridgeForwardAsync()
+    {
+        if (!_isPeripersonalWorkflow)
+        {
+            return null;
+        }
+
+        var selector = await DispatchAsync(ResolveHeadsetActionSelector).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(selector))
+        {
+            return new OperationOutcome(
+                OperationOutcomeKind.Warning,
+                "Unity HTTP bridge forwarding skipped.",
+                "Connect USB ADB or Wi-Fi ADB before launching the Peripersonal runtime so the operator can reach http://127.0.0.1:8787/v1/status.");
+        }
+
+        var adbPath = ResolvePeripersonalAdbPath();
+        if (string.IsNullOrWhiteSpace(adbPath))
+        {
+            return new OperationOutcome(
+                OperationOutcomeKind.Failure,
+                "adb.exe is unavailable.",
+                $"Install official platform tools in the companion setup or set VISCEREALITY_ADB_EXE. Expected managed path: {OfficialQuestToolingLayout.AdbExecutablePath}");
+        }
+
+        return await new PeripersonalAdbQuestHttpForwarder(adbPath, selector)
+            .EnsureUnityHttpBridgeForwardAsync()
+            .ConfigureAwait(false);
     }
 
     private async Task ApplyPeripersonalWorkflowResultAsync(
@@ -6946,6 +7375,101 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
             }.Where(static value => !string.IsNullOrWhiteSpace(value)));
     }
 
+    private Task DecreasePeripersonalParticipantNumberAsync()
+    {
+        ChangePeripersonalParticipantNumber(-1, loadLedgerEntry: true);
+        return Task.CompletedTask;
+    }
+
+    private Task IncreasePeripersonalParticipantNumberAsync()
+    {
+        ChangePeripersonalParticipantNumber(1, loadLedgerEntry: true);
+        return Task.CompletedTask;
+    }
+
+    private void ChangePeripersonalParticipantNumber(int delta, bool loadLedgerEntry)
+        => SetPeripersonalParticipantNumber(_peripersonalParticipantNumberValue + delta, loadLedgerEntry);
+
+    private void SetPeripersonalParticipantNumber(int value, bool loadLedgerEntry)
+    {
+        var clampedValue = Math.Clamp(value, PeripersonalParticipantNumberMinimum, PeripersonalParticipantNumberMaximum);
+        var formattedNumber = FormatPeripersonalParticipantNumber(clampedValue);
+        _peripersonalParticipantNumberValue = clampedValue;
+        ParticipantIdDraft = formattedNumber;
+        RefreshPeripersonalParticipantNumberProperties();
+
+        if (loadLedgerEntry)
+        {
+            ApplyPeripersonalParticipantLedgerEntry(formattedNumber);
+        }
+    }
+
+    private void ApplyPeripersonalParticipantLedgerEntry(string participantNumber)
+    {
+        var entry = PeripersonalParticipantLedger.FindLatest(participantNumber, _study.Id);
+        if (entry is null)
+        {
+            PeripersonalParticipantNameDraft = string.Empty;
+            PeripersonalParticipantAgeDraft = string.Empty;
+            return;
+        }
+
+        PeripersonalParticipantNameDraft = entry.ParticipantName;
+        PeripersonalParticipantAgeDraft = entry.Age;
+        if (!string.IsNullOrWhiteSpace(entry.Handedness))
+        {
+            PeripersonalHandednessDraft = entry.Handedness;
+        }
+    }
+
+    private void SynchronizePeripersonalParticipantNumberValue(string value)
+    {
+        if (!_isPeripersonalWorkflow || !TryParsePeripersonalParticipantNumber(value, out var participantNumberValue))
+        {
+            return;
+        }
+
+        _peripersonalParticipantNumberValue = participantNumberValue;
+        RefreshPeripersonalParticipantNumberProperties();
+    }
+
+    private void RefreshPeripersonalParticipantNumberProperties()
+    {
+        OnPropertyChanged(nameof(PeripersonalParticipantNumberDisplay));
+        OnPropertyChanged(nameof(CanDecreasePeripersonalParticipantNumber));
+        OnPropertyChanged(nameof(CanIncreasePeripersonalParticipantNumber));
+        DecreasePeripersonalParticipantNumberCommand?.RaiseCanExecuteChanged();
+        IncreasePeripersonalParticipantNumberCommand?.RaiseCanExecuteChanged();
+    }
+
+    private static string FormatPeripersonalParticipantNumber(int value)
+        => $"P{Math.Clamp(value, PeripersonalParticipantNumberMinimum, PeripersonalParticipantNumberMaximum).ToString("000", CultureInfo.InvariantCulture)}";
+
+    private static bool TryParsePeripersonalParticipantNumber(string? value, out int participantNumber)
+    {
+        participantNumber = 0;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var trimmed = value.Trim();
+        if (!trimmed.StartsWith("P", StringComparison.OrdinalIgnoreCase)
+            || trimmed.Length != 4
+            || !int.TryParse(trimmed[1..], NumberStyles.None, CultureInfo.InvariantCulture, out var parsed)
+            || parsed < PeripersonalParticipantNumberMinimum
+            || parsed > PeripersonalParticipantNumberMaximum)
+        {
+            return false;
+        }
+
+        participantNumber = parsed;
+        return true;
+    }
+
+    private static bool IsValidPeripersonalParticipantNumber(string? value)
+        => TryParsePeripersonalParticipantNumber(value, out _);
+
     private void RefreshPeripersonalWorkflowProperties()
     {
         if (!_isPeripersonalWorkflow)
@@ -6954,7 +7478,14 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
         }
 
         OnPropertyChanged(nameof(PeripersonalBreathControllerSideLabel));
+        OnPropertyChanged(nameof(PeripersonalParticipantNumberDisplay));
+        OnPropertyChanged(nameof(CanDecreasePeripersonalParticipantNumber));
+        OnPropertyChanged(nameof(CanIncreasePeripersonalParticipantNumber));
+        OnPropertyChanged(nameof(PeripersonalParticipantNameDraft));
+        OnPropertyChanged(nameof(PeripersonalParticipantAgeDraft));
+        OnPropertyChanged(nameof(PeripersonalSessionParticipantSummary));
         OnPropertyChanged(nameof(PeripersonalLanguageCodeDraft));
+        OnPropertyChanged(nameof(CanSavePeripersonalSessionPreparation));
         OnPropertyChanged(nameof(CanPreparePeripersonalSession));
         OnPropertyChanged(nameof(CanOpenPeripersonalQuestionnaireBlock1));
         OnPropertyChanged(nameof(CanOpenPeripersonalQuestionnaireBlock2));
@@ -6980,10 +7511,779 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
         MarkPeripersonalBlock1SubmittedCommand?.RaiseCanExecuteChanged();
         MarkPeripersonalXrBlockEndCommand?.RaiseCanExecuteChanged();
         RunPeripersonalClockProbeCommand?.RaiseCanExecuteChanged();
+        DecreasePeripersonalParticipantNumberCommand?.RaiseCanExecuteChanged();
+        IncreasePeripersonalParticipantNumberCommand?.RaiseCanExecuteChanged();
         StartExperimentCommand?.RaiseCanExecuteChanged();
         EndExperimentCommand?.RaiseCanExecuteChanged();
         ToggleRecordingCommand?.RaiseCanExecuteChanged();
         ToggleParticlesCommand?.RaiseCanExecuteChanged();
+        RefreshPeripersonalRunnerBlockProperties();
+    }
+
+    private void RefreshPeripersonalRunnerProperties()
+        => RefreshPeripersonalRunnerBlockProperties();
+
+    private void RefreshPeripersonalRunnerBlockProperties()
+    {
+        if (!_isPeripersonalWorkflow)
+        {
+            return;
+        }
+
+        OnPropertyChanged(nameof(CanToggleParticles));
+        OnPropertyChanged(nameof(IsParticlesToggleState));
+        OnPropertyChanged(nameof(ParticlesToggleActionLabel));
+        OnPropertyChanged(nameof(ParticlesLevel));
+        OnPropertyChanged(nameof(ParticlesSummary));
+        OnPropertyChanged(nameof(ParticlesDetail));
+        OnPropertyChanged(nameof(CanShowPeripersonalBlock1));
+        OnPropertyChanged(nameof(CanShowPeripersonalBlock2));
+        OnPropertyChanged(nameof(CanShowPeripersonalBlock3));
+        OnPropertyChanged(nameof(CanFinishPeripersonalBlock1));
+        OnPropertyChanged(nameof(CanFinishPeripersonalBlock2));
+        OnPropertyChanged(nameof(CanFinishPeripersonalBlock3));
+        OnPropertyChanged(nameof(IsPeripersonalBlock1Active));
+        OnPropertyChanged(nameof(IsPeripersonalBlock2Active));
+        OnPropertyChanged(nameof(IsPeripersonalBlock3Active));
+        OnPropertyChanged(nameof(CanTogglePeripersonalBlock1));
+        OnPropertyChanged(nameof(CanTogglePeripersonalBlock2));
+        OnPropertyChanged(nameof(CanTogglePeripersonalBlock3));
+        OnPropertyChanged(nameof(PeripersonalBlock1Level));
+        OnPropertyChanged(nameof(PeripersonalBlock2Level));
+        OnPropertyChanged(nameof(PeripersonalBlock3Level));
+        OnPropertyChanged(nameof(PeripersonalBlock1Summary));
+        OnPropertyChanged(nameof(PeripersonalBlock2Summary));
+        OnPropertyChanged(nameof(PeripersonalBlock3Summary));
+
+        ShowPeripersonalBlock1Command?.RaiseCanExecuteChanged();
+        ShowPeripersonalBlock2Command?.RaiseCanExecuteChanged();
+        ShowPeripersonalBlock3Command?.RaiseCanExecuteChanged();
+        FinishPeripersonalBlock1Command?.RaiseCanExecuteChanged();
+        FinishPeripersonalBlock2Command?.RaiseCanExecuteChanged();
+        FinishPeripersonalBlock3Command?.RaiseCanExecuteChanged();
+        ToggleParticlesCommand?.RaiseCanExecuteChanged();
+        TogglePeripersonalBlock1Command?.RaiseCanExecuteChanged();
+        TogglePeripersonalBlock2Command?.RaiseCanExecuteChanged();
+        TogglePeripersonalBlock3Command?.RaiseCanExecuteChanged();
+    }
+
+    private bool IsPeripersonalQuestionnaireBlockVisible(string blockId)
+        => string.Equals(
+            _peripersonalVisibleQuestionnaireBlock,
+            NormalizePeripersonalBlockId(blockId),
+            StringComparison.OrdinalIgnoreCase);
+
+    private void TryApplyPeripersonalQuestionnaireCompletionFromReportedState()
+    {
+        if (!_isPeripersonalWorkflow || _peripersonalWorkflow is null || _reportedTwinState.Count == 0)
+        {
+            return;
+        }
+
+        if (!TryGetPeripersonalReportedStateValue(out var status, "questionnaire_status", "questionnaire.status", "panel_status", "panel.status")
+            || !IsPeripersonalQuestionnaireCompletedStatus(status))
+        {
+            return;
+        }
+
+        if (!TryResolvePeripersonalBlockFromReportedState(out var blockId))
+        {
+            return;
+        }
+
+        MarkPeripersonalQuestionnaireBlockFinishedFromRuntime(blockId);
+    }
+
+    private void StartPeripersonalHeadsetEventMonitor()
+    {
+        if (!_isPeripersonalWorkflow)
+        {
+            return;
+        }
+
+        if (_peripersonalHeadsetEventMonitorTask is { IsCompleted: false })
+        {
+            return;
+        }
+
+        _lastPeripersonalHeadsetEventSignature = string.Empty;
+        lock (_peripersonalQuestQuestionnaireResultLock)
+        {
+            _seenPeripersonalQuestQuestionnaireResultSignatures.Clear();
+        }
+
+        var cts = new CancellationTokenSource();
+        _peripersonalHeadsetEventMonitorCts = cts;
+        _peripersonalHeadsetEventMonitorTask = Task.Run(
+            () => MonitorPeripersonalHeadsetEventsAsync(cts.Token),
+            CancellationToken.None);
+    }
+
+    private async Task MonitorPeripersonalHeadsetEventsAsync(CancellationToken cancellationToken)
+    {
+        var runtimeStateStreamName = await DispatchAsync(ResolvePeripersonalRuntimeStateStreamName)
+            .ConfigureAwait(false);
+        var monitorTasks = new List<Task>
+        {
+            MonitorPeripersonalHeadsetSubscriptionAsync(
+                _peripersonalHeadsetEventMonitorService,
+                new LslMonitorSubscription(
+                    PeripersonalLslCommandTransport.AckStreamName,
+                    PeripersonalLslCommandTransport.AckStreamType,
+                    ChannelIndex: 0),
+                cancellationToken)
+        };
+
+        if (!string.IsNullOrWhiteSpace(runtimeStateStreamName))
+        {
+            monitorTasks.Add(MonitorPeripersonalHeadsetSubscriptionAsync(
+                _peripersonalRuntimeStateMonitorService,
+                new LslMonitorSubscription(
+                    runtimeStateStreamName,
+                    PeripersonalRuntimeStateStreamType,
+                    ChannelIndex: 0),
+                cancellationToken));
+        }
+
+        monitorTasks.Add(MonitorPeripersonalUnityHttpStatusAsync(cancellationToken));
+        monitorTasks.Add(MonitorPeripersonalQuestQuestionnaireResultsAsync(cancellationToken));
+
+        await Task.WhenAll(monitorTasks).ConfigureAwait(false);
+    }
+
+    private async Task MonitorPeripersonalHeadsetSubscriptionAsync(
+        ILslMonitorService monitorService,
+        LslMonitorSubscription subscription,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await foreach (var reading in monitorService
+                               .MonitorAsync(subscription, cancellationToken)
+                               .ConfigureAwait(false))
+            {
+                if (!reading.Status.Contains("Streaming", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                await DispatchAsync(() => ApplyPeripersonalRuntimeStateReading(reading))
+                    .ConfigureAwait(false);
+
+                if (PeripersonalHeadsetEventInterpreter.TryParseQuestionnaireEvent(reading, out var headsetEvent))
+                {
+                    await DispatchAsync(() => ApplyPeripersonalHeadsetQuestionnaireEvent(headsetEvent))
+                        .ConfigureAwait(false);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+    }
+
+    private async Task MonitorPeripersonalUnityHttpStatusAsync(CancellationToken cancellationToken)
+    {
+        using var httpClient = new HttpClient
+        {
+            Timeout = PeripersonalUnityHttpStatusTimeout
+        };
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                var statusJson = await httpClient
+                    .GetStringAsync(PeripersonalUnityHttpStatusUri, cancellationToken)
+                    .ConfigureAwait(false);
+                if (!string.IsNullOrWhiteSpace(statusJson))
+                {
+                    var reading = new LslMonitorReading(
+                        "Streaming Unity HTTP status.",
+                        $"Unity HTTP bridge status from {PeripersonalUnityHttpStatusUri}.",
+                        null,
+                        0,
+                        DateTimeOffset.UtcNow,
+                        TextValue: statusJson,
+                        SampleValues: [statusJson],
+                        ChannelFormat: LslChannelFormat.String);
+
+                    await DispatchAsync(() => ApplyPeripersonalRuntimeStateReading(reading))
+                        .ConfigureAwait(false);
+
+                    if (PeripersonalHeadsetEventInterpreter.TryParseQuestionnaireEvent(reading, out var headsetEvent))
+                    {
+                        await DispatchAsync(() => ApplyPeripersonalHeadsetQuestionnaireEvent(headsetEvent))
+                            .ConfigureAwait(false);
+                    }
+                }
+            }
+            catch (HttpRequestException)
+            {
+            }
+            catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            try
+            {
+                await Task.Delay(PeripersonalUnityHttpStatusPollInterval, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+        }
+    }
+
+    private async Task MonitorPeripersonalQuestQuestionnaireResultsAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                var target = await DispatchAsync(CapturePeripersonalQuestQuestionnaireResultTarget)
+                    .ConfigureAwait(false);
+                if (target.IsReady)
+                {
+                    var jsonl = await ReadPeripersonalQuestTextFileAsync(
+                            target.AdbPath,
+                            target.Selector,
+                            target.RemotePath,
+                            PeripersonalQuestResultFileReadTimeout,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+
+                    foreach (var headsetEvent in PeripersonalQuestionnaireResultFileInterpreter.ParseCompletionEvents(jsonl))
+                    {
+                        var signature = BuildPeripersonalQuestQuestionnaireResultSignature(
+                            target.SessionFolderName,
+                            headsetEvent);
+                        var shouldApply = false;
+                        lock (_peripersonalQuestQuestionnaireResultLock)
+                        {
+                            shouldApply = _seenPeripersonalQuestQuestionnaireResultSignatures.Add(signature);
+                        }
+
+                        if (shouldApply)
+                        {
+                            await DispatchAsync(() => ApplyPeripersonalHeadsetQuestionnaireEvent(headsetEvent))
+                                .ConfigureAwait(false);
+                        }
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return;
+                }
+            }
+            catch (InvalidOperationException)
+            {
+            }
+            catch (IOException)
+            {
+            }
+
+            try
+            {
+                await Task.Delay(PeripersonalQuestResultFilePollInterval, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+        }
+    }
+
+    private PeripersonalQuestQuestionnaireResultTarget CapturePeripersonalQuestQuestionnaireResultTarget()
+    {
+        var selector = ResolveHeadsetActionSelector();
+        var adbPath = ResolvePeripersonalAdbPath();
+        var sessionFolderName = _peripersonalWorkflow?.CurrentSession?.SessionFolderName ?? string.Empty;
+        var packageId = _study.App.PackageId;
+
+        if (string.IsNullOrWhiteSpace(selector)
+            || string.IsNullOrWhiteSpace(adbPath)
+            || string.IsNullOrWhiteSpace(sessionFolderName)
+            || string.IsNullOrWhiteSpace(packageId))
+        {
+            return PeripersonalQuestQuestionnaireResultTarget.Empty;
+        }
+
+        var remotePath = $"/sdcard/Android/data/{packageId}/files/runtime_csv/{sessionFolderName}/questionnaire_results.jsonl";
+        return new PeripersonalQuestQuestionnaireResultTarget(
+            adbPath,
+            selector,
+            sessionFolderName,
+            remotePath);
+    }
+
+    private static string BuildPeripersonalQuestQuestionnaireResultSignature(
+        string sessionFolderName,
+        PeripersonalQuestionnaireHeadsetEvent headsetEvent)
+        => string.Join(
+            "|",
+            sessionFolderName,
+            headsetEvent.RequestId,
+            headsetEvent.BlockId,
+            headsetEvent.Status);
+
+    private static async Task<string> ReadPeripersonalQuestTextFileAsync(
+        string adbPath,
+        string selector,
+        string remotePath,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(timeout);
+
+        using var process = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = adbPath,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            }
+        };
+        process.StartInfo.ArgumentList.Add("-s");
+        process.StartInfo.ArgumentList.Add(selector);
+        process.StartInfo.ArgumentList.Add("exec-out");
+        process.StartInfo.ArgumentList.Add("cat");
+        process.StartInfo.ArgumentList.Add(remotePath);
+
+        if (!process.Start())
+        {
+            return string.Empty;
+        }
+
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(timeoutCts.Token);
+        var stderrTask = process.StandardError.ReadToEndAsync(timeoutCts.Token);
+        try
+        {
+            await process.WaitForExitAsync(timeoutCts.Token).ConfigureAwait(false);
+            var stdout = await stdoutTask.ConfigureAwait(false);
+            _ = await stderrTask.ConfigureAwait(false);
+            return process.ExitCode == 0 ? stdout : string.Empty;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+            }
+            catch (InvalidOperationException)
+            {
+            }
+
+            return string.Empty;
+        }
+    }
+
+    private string ResolvePeripersonalRuntimeStateStreamName()
+    {
+        var participantRef = _peripersonalWorkflow?.CurrentSession?.ParticipantRef;
+        if (string.IsNullOrWhiteSpace(participantRef))
+        {
+            participantRef = ParticipantIdDraft;
+        }
+
+        participantRef = participantRef?.Trim() ?? string.Empty;
+        return string.IsNullOrWhiteSpace(participantRef)
+            ? string.Empty
+            : $"{PeripersonalOperatorWorkflowService.RuntimeStateStreamPrefix}_{participantRef}";
+    }
+
+    private void ApplyPeripersonalRuntimeStateReading(LslMonitorReading reading)
+    {
+        if (!_isPeripersonalWorkflow)
+        {
+            return;
+        }
+
+        if (PeripersonalRuntimeStateInterpreter.TryParseParticleVisibility(reading, out var particlesVisible))
+        {
+            if (_peripersonalPendingParticlesVisible == particlesVisible)
+            {
+                _peripersonalPendingParticlesVisible = null;
+            }
+
+            if (_peripersonalParticlesVisible != particlesVisible)
+            {
+                _peripersonalParticlesVisible = particlesVisible;
+            }
+
+            if (particlesVisible)
+            {
+                _workflowGuideParticlesOnVerified = true;
+            }
+            else
+            {
+                _workflowGuideParticlesOffVerified = true;
+            }
+
+            UpdatePeripersonalParticlesCard();
+            RefreshPeripersonalRunnerProperties();
+        }
+    }
+
+    private void ApplyConfirmedPeripersonalParticleVisibility(bool visible)
+    {
+        if (!_isPeripersonalWorkflow)
+        {
+            return;
+        }
+
+        _peripersonalParticlesVisible = visible;
+        if (_peripersonalPendingParticlesVisible == visible)
+        {
+            _peripersonalPendingParticlesVisible = null;
+        }
+
+        if (visible)
+        {
+            _workflowGuideParticlesOnVerified = true;
+        }
+        else
+        {
+            _workflowGuideParticlesOffVerified = true;
+        }
+
+        UpdatePeripersonalParticlesCard();
+        RefreshPeripersonalRunnerProperties();
+    }
+
+    private void ApplyConfirmedPeripersonalQuestionnaireLaunch(string blockId)
+    {
+        var normalizedBlockId = NormalizePeripersonalBlockId(blockId);
+        if (!_isPeripersonalWorkflow || string.IsNullOrWhiteSpace(normalizedBlockId))
+        {
+            return;
+        }
+
+        _peripersonalVisibleQuestionnaireBlock = normalizedBlockId;
+        RefreshPeripersonalRunnerBlockProperties();
+    }
+
+    private void ApplyConfirmedPeripersonalQuestionnaireClose(string blockId)
+    {
+        var normalizedBlockId = NormalizePeripersonalBlockId(blockId);
+        if (!_isPeripersonalWorkflow || string.IsNullOrWhiteSpace(normalizedBlockId))
+        {
+            return;
+        }
+
+        if (IsPeripersonalQuestionnaireBlockVisible(normalizedBlockId))
+        {
+            _peripersonalVisibleQuestionnaireBlock = string.Empty;
+        }
+
+        RefreshPeripersonalRunnerBlockProperties();
+    }
+
+    private async Task StopPeripersonalHeadsetEventMonitorAsync()
+    {
+        var cts = _peripersonalHeadsetEventMonitorCts;
+        var task = _peripersonalHeadsetEventMonitorTask;
+        _peripersonalHeadsetEventMonitorCts = null;
+        _peripersonalHeadsetEventMonitorTask = null;
+
+        if (cts is null && task is null)
+        {
+            return;
+        }
+
+        cts?.Cancel();
+        try
+        {
+            if (task is not null)
+            {
+                await Task.WhenAny(task, Task.Delay(PeripersonalHeadsetEventMonitorStopTimeout))
+                    .ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            cts?.Dispose();
+        }
+    }
+
+    private void ApplyPeripersonalHeadsetQuestionnaireEvent(PeripersonalQuestionnaireHeadsetEvent headsetEvent)
+    {
+        if (!_isPeripersonalWorkflow || _peripersonalWorkflow is null)
+        {
+            return;
+        }
+
+        var blockId = NormalizePeripersonalBlockId(headsetEvent.BlockId);
+        if (string.IsNullOrWhiteSpace(blockId)
+            && headsetEvent.IsCompletion
+            && !string.IsNullOrWhiteSpace(_peripersonalVisibleQuestionnaireBlock))
+        {
+            blockId = _peripersonalVisibleQuestionnaireBlock;
+        }
+
+        if (string.IsNullOrWhiteSpace(blockId))
+        {
+            return;
+        }
+
+        var signature = string.Join(
+            "|",
+            headsetEvent.CommandId,
+            headsetEvent.RequestId,
+            blockId,
+            headsetEvent.Status,
+            headsetEvent.Action);
+        if (string.Equals(signature, _lastPeripersonalHeadsetEventSignature, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        _lastPeripersonalHeadsetEventSignature = signature;
+        if (headsetEvent.IsCompletion)
+        {
+            MarkPeripersonalQuestionnaireBlockFinishedFromRuntime(blockId);
+            PeripersonalWorkflowSummary = $"{FormatPeripersonalBlockLabel(blockId)} finished on the headset.";
+            PeripersonalWorkflowDetail = "The Windows runner updated from the headset acknowledgement stream, Unity HTTP status bridge, or Quest questionnaire result file.";
+            return;
+        }
+
+        if (headsetEvent.IsLaunch)
+        {
+            _peripersonalVisibleQuestionnaireBlock = blockId;
+            RefreshPeripersonalRunnerBlockProperties();
+        }
+    }
+
+    private void MarkPeripersonalQuestionnaireBlockFinishedFromRuntime(string blockId)
+    {
+        var normalizedBlockId = NormalizePeripersonalBlockId(blockId);
+        if (string.IsNullOrWhiteSpace(normalizedBlockId))
+        {
+            return;
+        }
+
+        _peripersonalWorkflow?.RecordQuestionnaireSubmitted(normalizedBlockId);
+        if (string.Equals(normalizedBlockId, PeripersonalBlockOneId, StringComparison.OrdinalIgnoreCase))
+        {
+            PeripersonalQuestionnaireBlockOneSubmitted = true;
+        }
+        else if (string.Equals(normalizedBlockId, "block-2", StringComparison.OrdinalIgnoreCase))
+        {
+            _peripersonalQuestionnaireBlockTwoSubmitted = true;
+        }
+        else if (string.Equals(normalizedBlockId, "block-3", StringComparison.OrdinalIgnoreCase))
+        {
+            _peripersonalQuestionnaireBlockThreeSubmitted = true;
+        }
+
+        if (IsPeripersonalQuestionnaireBlockVisible(normalizedBlockId))
+        {
+            _peripersonalVisibleQuestionnaireBlock = string.Empty;
+        }
+
+        RefreshPeripersonalRunnerBlockProperties();
+    }
+
+    private bool TryResolvePeripersonalBlockFromReportedState(out string blockId)
+    {
+        foreach (var key in new[]
+                 {
+                     "operator_questionnaire_block_id",
+                     "questionnaire_block_id",
+                     "questionnaire.block_id",
+                     "block_id",
+                     "block",
+                     "active_block",
+                     "current_block",
+                     "open_stage",
+                     "questionnaire_open_stage",
+                     "questionnaire.open_stage",
+                     "questionnaire_stage",
+                     "questionnaire.stage",
+                     "stage",
+                     "request_id",
+                     "questionnaire_request_id",
+                     "questionnaire.request_id",
+                     "condition_number",
+                     "questionnaire_condition_number"
+                 })
+        {
+            if (TryGetPeripersonalReportedStateValue(out var value, key)
+                && TryNormalizePeripersonalBlockValue(value, out blockId))
+            {
+                return true;
+            }
+        }
+
+        blockId = string.Empty;
+        return false;
+    }
+
+    private bool TryGetPeripersonalReportedStateValue(out string value, params string[] keys)
+    {
+        foreach (var key in keys)
+        {
+            if (_reportedTwinState.TryGetValue(key, out var exactValue)
+                && !string.IsNullOrWhiteSpace(exactValue))
+            {
+                value = exactValue;
+                return true;
+            }
+
+            var suffix = "." + key;
+            var underscoreSuffix = "_" + key.Replace('.', '_');
+            var matching = _reportedTwinState.FirstOrDefault(pair =>
+                !string.IsNullOrWhiteSpace(pair.Value)
+                && (pair.Key.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)
+                    || pair.Key.EndsWith(underscoreSuffix, StringComparison.OrdinalIgnoreCase)));
+            if (!string.IsNullOrWhiteSpace(matching.Value))
+            {
+                value = matching.Value;
+                return true;
+            }
+        }
+
+        value = string.Empty;
+        return false;
+    }
+
+    private static bool IsPeripersonalQuestionnaireCompletedStatus(string status)
+    {
+        if (string.IsNullOrWhiteSpace(status))
+        {
+            return false;
+        }
+
+        var normalized = status.Trim().ToLowerInvariant();
+        return normalized.Contains("complete", StringComparison.Ordinal)
+            || normalized.Contains("completed", StringComparison.Ordinal)
+            || normalized.Contains("submitted", StringComparison.Ordinal)
+            || normalized.Contains("finished", StringComparison.Ordinal)
+            || normalized.Contains("result_received", StringComparison.Ordinal)
+            || normalized.Contains("result_recorded", StringComparison.Ordinal)
+            || normalized.Contains("callback_received", StringComparison.Ordinal)
+            || normalized.Contains("returned_to_unity", StringComparison.Ordinal);
+    }
+
+    private static bool TryNormalizePeripersonalBlockValue(string? value, out string blockId)
+    {
+        blockId = string.Empty;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var normalized = value.Trim().ToLowerInvariant();
+        if (normalized.Contains("block-1", StringComparison.Ordinal)
+            || normalized.Contains("block_1", StringComparison.Ordinal)
+            || normalized.Contains("block1", StringComparison.Ordinal)
+            || normalized.Contains("language_selection", StringComparison.Ordinal)
+            || normalized.Contains("demographics", StringComparison.Ordinal)
+            || normalized.Contains("maia2", StringComparison.Ordinal)
+            || normalized == "1")
+        {
+            blockId = PeripersonalBlockOneId;
+            return true;
+        }
+
+        if (normalized.Contains("block-2", StringComparison.Ordinal)
+            || normalized.Contains("block_2", StringComparison.Ordinal)
+            || normalized.Contains("block2", StringComparison.Ordinal)
+            || normalized.Contains("spatial_frame_reference_1", StringComparison.Ordinal)
+            || normalized == "2")
+        {
+            blockId = "block-2";
+            return true;
+        }
+
+        if (normalized.Contains("block-3", StringComparison.Ordinal)
+            || normalized.Contains("block_3", StringComparison.Ordinal)
+            || normalized.Contains("block3", StringComparison.Ordinal)
+            || normalized.Contains("spatial_frame_reference_2", StringComparison.Ordinal)
+            || normalized == "3")
+        {
+            blockId = "block-3";
+            return true;
+        }
+
+        return false;
+    }
+
+    private OperationOutcomeKind GetPeripersonalBlockLevel(string blockId, bool finished, bool canShow)
+        => IsPeripersonalQuestionnaireBlockVisible(blockId)
+            ? OperationOutcomeKind.Success
+            : finished
+                ? OperationOutcomeKind.Preview
+                : canShow
+                    ? OperationOutcomeKind.Warning
+                    : OperationOutcomeKind.Preview;
+
+    private string GetPeripersonalBlockSummary(string blockId, bool finished, bool canShow)
+    {
+        if (IsPeripersonalQuestionnaireBlockVisible(blockId))
+        {
+            return "On screen now. Waiting for headset finish confirmation.";
+        }
+
+        if (finished)
+        {
+            return "Finished by headset signal or operator override.";
+        }
+
+        return canShow
+            ? "Ready to show."
+            : "Recording must be active.";
+    }
+
+    private static string NormalizePeripersonalBlockId(string blockId)
+        => string.IsNullOrWhiteSpace(blockId) ? string.Empty : blockId.Trim().ToLowerInvariant();
+
+    private static string FormatPeripersonalBlockLabel(string blockId)
+        => string.Equals(blockId, PeripersonalBlockOneId, StringComparison.OrdinalIgnoreCase)
+            ? "Block 1"
+            : string.Equals(blockId, "block-2", StringComparison.OrdinalIgnoreCase)
+                ? "Block 2"
+                : string.Equals(blockId, "block-3", StringComparison.OrdinalIgnoreCase)
+                    ? "Block 3"
+                    : "Block";
+
+    private readonly record struct PeripersonalQuestQuestionnaireResultTarget(
+        string AdbPath,
+        string Selector,
+        string SessionFolderName,
+        string RemotePath)
+    {
+        public static PeripersonalQuestQuestionnaireResultTarget Empty { get; } = new(
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            string.Empty);
+
+        public bool IsReady
+            => !string.IsNullOrWhiteSpace(AdbPath)
+               && !string.IsNullOrWhiteSpace(Selector)
+               && !string.IsNullOrWhiteSpace(SessionFolderName)
+               && !string.IsNullOrWhiteSpace(RemotePath);
     }
 
     private static string ResolvePeripersonalAdbPath()
@@ -7767,6 +9067,7 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
             "viscereality.media_volume_music" => "Media volume",
             "viscereality.minimum_headset_battery_percent" => "Minimum headset battery (%)",
             "viscereality.minimum_right_controller_battery_percent" => "Minimum right controller battery (%)",
+            RequiredExperimentWifiSsidDeviceProfileKey => "Required Wi-Fi SSID",
             _ => key
         };
 
@@ -7793,6 +9094,7 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
     {
         var selector = _headsetStatus?.ConnectionLabel ?? string.Empty;
         var isWifiAdbActive = _headsetStatus?.IsWifiAdbTransport == true;
+        var requiredWifiReady = GetRequiredExperimentWifiReady(_headsetStatus);
         var lastConnectionFailed = _lastConnectionLevel == OperationOutcomeKind.Failure;
         var wifiPreparedButNotConnected =
             string.Equals(_lastConnectionActionLabel, "Enable Wi-Fi ADB", StringComparison.Ordinal)
@@ -7806,8 +9108,8 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
 
         HeadsetWifiSummary = headsetWifiLabel;
         HostWifiSummary = hostWifiLabel;
-        WifiNetworkMatchLevel = OperationOutcomeKind.Preview;
-        WifiNetworkMatchSummary = "Wi-Fi match unknown.";
+        WifiNetworkMatchLevel = GetRequiredExperimentWifiLevel(_headsetStatus);
+        WifiNetworkMatchSummary = GetRequiredExperimentWifiSummary(_headsetStatus);
 
         if (_headsetStatus is null)
         {
@@ -7831,43 +9133,27 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
             return;
         }
 
-        var routedTopologyAccepted = _questWifiTransportDiagnostics?.RoutedTopologyAccepted == true;
-        WifiNetworkMatchLevel = _headsetStatus.WifiSsidMatchesHost switch
-        {
-            true => OperationOutcomeKind.Success,
-            false when routedTopologyAccepted => OperationOutcomeKind.Success,
-            false => OperationOutcomeKind.Failure,
-            _ when routedTopologyAccepted => OperationOutcomeKind.Success,
-            _ => OperationOutcomeKind.Warning
-        };
-        WifiNetworkMatchSummary = _headsetStatus.WifiSsidMatchesHost switch
-        {
-            true => "Wi-Fi names match.",
-            false when routedTopologyAccepted => "Different SSIDs, but the routed Quest path is valid.",
-            false => "Wi-Fi names do not match.",
-            _ when routedTopologyAccepted => "Routed Quest path is valid.",
-            _ => "Wi-Fi match unknown."
-        };
-
         if (isWifiAdbActive)
         {
-            ConnectionCardLevel = _headsetStatus.WifiSsidMatchesHost == false && !routedTopologyAccepted
+            ConnectionCardLevel = requiredWifiReady == false
                 ? OperationOutcomeKind.Warning
                 : OperationOutcomeKind.Success;
-            ConnectionTransportLevel = _headsetStatus.WifiSsidMatchesHost == false && !routedTopologyAccepted
+            ConnectionTransportLevel = requiredWifiReady == false
                 ? OperationOutcomeKind.Failure
-                : OperationOutcomeKind.Success;
-            ConnectionTransportSummary = _headsetStatus.WifiSsidMatchesHost == false && !routedTopologyAccepted
-                ? "ADB over Wi-Fi: on, but network names do not match."
-                : routedTopologyAccepted
-                    ? "ADB over Wi-Fi: on over a valid routed host path."
-                : "ADB over Wi-Fi: on.";
-            ConnectionTransportDetail = _headsetStatus.WifiSsidMatchesHost switch
+                : requiredWifiReady == true
+                    ? OperationOutcomeKind.Success
+                    : OperationOutcomeKind.Warning;
+            ConnectionTransportSummary = requiredWifiReady switch
             {
-                true => $"Remote control is using {selector}, and the headset Wi-Fi matches this PC.",
-                false when routedTopologyAccepted => $"Remote control is using {selector}, and the Quest endpoint is reachable over the current routed host path. Matching PC Wi-Fi names are not required on this topology.",
-                false => $"Remote control is using {selector}, but the headset Wi-Fi does not match this PC.",
-                _ => $"Remote control is using {selector}. Verify the headset Wi-Fi name before starting the session."
+                true => $"ADB over Wi-Fi: on via {RequiredExperimentWifiSsidValue}.",
+                false => $"ADB over Wi-Fi: on, but not on {RequiredExperimentWifiSsidValue}.",
+                _ => "ADB over Wi-Fi: on, but Wi-Fi names are unknown."
+            };
+            ConnectionTransportDetail = requiredWifiReady switch
+            {
+                true => $"Remote control is using {selector}, and both the headset and this PC report Wi-Fi `{RequiredExperimentWifiSsidValue}`.",
+                false => $"Remote control is using {selector}, but the experiment requires both the headset and this PC to be connected to Wi-Fi `{RequiredExperimentWifiSsidValue}`. {BuildRequiredExperimentWifiDetail(_headsetStatus)}",
+                _ => $"Remote control is using {selector}. Refresh the headset snapshot until both the headset Wi-Fi and PC Wi-Fi names are visible, then confirm both are `{RequiredExperimentWifiSsidValue}`."
             };
             return;
         }
@@ -7906,6 +9192,57 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
 
         return "Headset Wi-Fi: n/a";
     }
+
+    private bool IsRequiredExperimentWifiReady()
+        => GetRequiredExperimentWifiReady(_headsetStatus) == true;
+
+    private static bool? GetRequiredExperimentWifiReady(HeadsetAppStatus? status)
+    {
+        if (status is null || !status.IsConnected)
+        {
+            return null;
+        }
+
+        var hasHeadsetSsid = !string.IsNullOrWhiteSpace(status.HeadsetWifiSsid);
+        var hasHostSsid = !string.IsNullOrWhiteSpace(status.HostWifiSsid);
+        if (!hasHeadsetSsid || !hasHostSsid)
+        {
+            return null;
+        }
+
+        return IsRequiredExperimentWifiSsid(status.HeadsetWifiSsid)
+            && IsRequiredExperimentWifiSsid(status.HostWifiSsid);
+    }
+
+    private static OperationOutcomeKind GetRequiredExperimentWifiLevel(HeadsetAppStatus? status)
+        => GetRequiredExperimentWifiReady(status) switch
+        {
+            true => OperationOutcomeKind.Success,
+            false => OperationOutcomeKind.Failure,
+            _ => OperationOutcomeKind.Warning
+        };
+
+    private static string GetRequiredExperimentWifiSummary(HeadsetAppStatus? status)
+        => GetRequiredExperimentWifiReady(status) switch
+        {
+            true => $"Experiment Wi-Fi ready: both devices are on {RequiredExperimentWifiSsidValue}.",
+            false => $"Experiment Wi-Fi mismatch: both devices must be on {RequiredExperimentWifiSsidValue}.",
+            _ => $"Experiment Wi-Fi unknown: expected {RequiredExperimentWifiSsidValue}."
+        };
+
+    private static string BuildRequiredExperimentWifiDetail(HeadsetAppStatus? status)
+    {
+        var headset = string.IsNullOrWhiteSpace(status?.HeadsetWifiSsid)
+            ? "n/a"
+            : status.HeadsetWifiSsid;
+        var host = string.IsNullOrWhiteSpace(status?.HostWifiSsid)
+            ? "n/a"
+            : status.HostWifiSsid;
+        return $"Headset Wi-Fi: {headset}. PC Wi-Fi: {host}. Required Wi-Fi: {RequiredExperimentWifiSsidValue}.";
+    }
+
+    private static bool IsRequiredExperimentWifiSsid(string? ssid)
+        => string.Equals(ssid?.Trim(), RequiredExperimentWifiSsidValue, StringComparison.Ordinal);
 
     private static string FormatAutoSleepLabel(int? autoSleepTimeMs)
         => autoSleepTimeMs is > 0
@@ -8408,6 +9745,7 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
             .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase);
         _visualProfiles.RefreshReportedTwinState(_reportedTwinState);
         _controllerBreathingProfiles.RefreshReportedTwinState(_reportedTwinState);
+        TryApplyPeripersonalQuestionnaireCompletionFromReportedState();
 
         var reportedDeviceSessionDir = GetFirstValue("study.recording.device.session_dir");
         if (!string.IsNullOrWhiteSpace(reportedDeviceSessionDir))
@@ -10647,12 +11985,18 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
         {
             ParticipantEntryLevel = OperationOutcomeKind.Preview;
             ParticipantEntrySummary = "Enter participant metadata before preparing the peripersonal session.";
-            ParticipantEntryDetail = "The prepared session folder will use participant id, session id, and a timestamp suffix.";
+            ParticipantEntryDetail = "The prepared session folder will use participant number, session id, and a timestamp suffix.";
         }
         else
         {
+            var participantName = string.IsNullOrWhiteSpace(PeripersonalParticipantNameDraft)
+                ? "Name n/a"
+                : $"Name: {PeripersonalParticipantNameDraft.Trim()}";
+            var ageLabel = string.IsNullOrWhiteSpace(PeripersonalParticipantAgeDraft)
+                ? "Age n/a"
+                : $"Age: {PeripersonalParticipantAgeDraft.Trim()}";
             ParticipantEntrySummary = $"Participant {normalizedParticipantId} metadata is ready.";
-            ParticipantEntryDetail = $"{PeripersonalBreathControllerSideLabel} Session id: {PeripersonalSessionIdDraft}. MAIA language: {PeripersonalLanguageCodeDraft}.";
+            ParticipantEntryDetail = $"{participantName}. {ageLabel}. {PeripersonalBreathControllerSideLabel}";
         }
 
         var session = _peripersonalWorkflow?.CurrentSession;
@@ -10703,11 +12047,9 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
             }
 
             RecordingDevicePullFolderPath = string.Empty;
-            RecorderStateLabel = PeripersonalQuestionnaireBlockOneSubmitted ? "Ready" : "Prepared";
-            RecordingLevel = PeripersonalQuestionnaireBlockOneSubmitted ? OperationOutcomeKind.Success : OperationOutcomeKind.Preview;
-            RecordingSummary = PeripersonalQuestionnaireBlockOneSubmitted
-                ? "Block 1 is submitted; Start Recording is now enabled."
-                : "Session prepared; open and submit Questionnaire Block 1 before recording.";
+            RecorderStateLabel = "Ready";
+            RecordingLevel = OperationOutcomeKind.Success;
+            RecordingSummary = "Session prepared; Start Experiment can begin recording now.";
             RecordingDetail = $"Windows metadata and command ledger are ready in {session.WindowsSessionDirectory}. Breath tracking is fixed to the {session.BreathTrackingControllerSide} controller for this session.";
             return;
         }
@@ -10716,8 +12058,8 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
         RecordingLevel = string.IsNullOrWhiteSpace(normalizedParticipantId) ? OperationOutcomeKind.Preview : OperationOutcomeKind.Success;
         RecordingSummary = string.IsNullOrWhiteSpace(normalizedParticipantId)
             ? "Peripersonal session idle."
-            : "Peripersonal session metadata is ready to prepare.";
-        RecordingDetail = "Prepare Session creates the Windows folder, sends setup metadata to Unity and the questionnaire panel, and waits for receipts before the operator can open Questionnaire Block 1.";
+            : "Peripersonal session metadata is ready; Start Experiment can prepare and begin recording.";
+        RecordingDetail = "Start Experiment creates the Windows folder, sends setup metadata to Unity and the questionnaire panel, and begins the active recording before Block 1 is run.";
         RecordingSessionLabel = string.IsNullOrWhiteSpace(_lastCompletedRecordingFolderPath)
             ? "No peripersonal session prepared yet."
             : $"Last completed session: {_lastCompletedRecordingFolderPath}";
@@ -10859,7 +12201,7 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
             WorkflowGuideActionLevel = wifiMatchGate.Level;
             WorkflowGuideActionSummary = wifiMatchGate.Summary;
             WorkflowGuideActionDetail = wifiMatchGate.Ready
-                ? "The headset Wi-Fi and the PC Wi-Fi already match. Use Next to continue."
+                ? $"The headset and PC both report Wi-Fi `{RequiredExperimentWifiSsidValue}`. Use Next to continue."
                 : wifiMatchGate.Detail;
             return;
         }
@@ -11209,7 +12551,7 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
             prepared ? "Peripersonal session is prepared." : "Peripersonal session metadata is not prepared yet.",
             prepared
                 ? PeripersonalWorkflowDetail
-                : "Enter participant id, session id, handedness, and MAIA language in this card. Prepare Session must create the timestamped session folder and send setup metadata before Questionnaire Block 1 opens.",
+                : "Enter participant id, session id, handedness, and MAIA language. Start Experiment then creates the timestamped session folder, sends setup metadata, and begins recording.",
             prepared);
     }
 
@@ -11221,8 +12563,8 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
             ready ? OperationOutcomeKind.Success : opened ? OperationOutcomeKind.Warning : OperationOutcomeKind.Preview,
             ready ? "Questionnaire Block 1 is marked submitted." : opened ? "Block 1 was opened; mark it submitted after participant submit." : "Questionnaire Block 1 has not been opened yet.",
             ready
-                ? "Block 1 is complete from the operator workflow point of view, so the single global recording can start."
-                : "Open Block 1 for the MAIA spatial questionnaire. After the participant submits the panel, use Block 1 Submitted so the Windows workflow unlocks Start Recording.",
+                ? "Block 1 is complete from the operator workflow point of view."
+                : "Open Block 1 for the MAIA spatial questionnaire inside the active experiment recording. After the participant submits the panel, mark Block 1 finished.",
             ready);
     }
 
@@ -11235,7 +12577,7 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
             recording && clockReady ? "Global recording and clock probe are ready." : recording ? "Global recording is active; run the clock probe." : "Global recording has not started yet.",
             recording
                 ? $"{RecordingDetail} {ClockAlignmentDetail}".Trim()
-                : "Start Recording once Block 1 has been submitted. This is the only recording start for the whole Peripersonal experiment.",
+                : "Start Experiment can begin recording as soon as participant metadata/session preparation is complete. Block 1 does not need to be finished first.",
             recording && clockReady);
     }
 
@@ -11317,8 +12659,7 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
 
     private WorkflowGuideGateState BuildWifiMatchWorkflowGuideGateState()
     {
-        var match = _headsetStatus?.WifiSsidMatchesHost;
-        var routedTopologyAccepted = _questWifiTransportDiagnostics?.RoutedTopologyAccepted == true;
+        var requiredWifiReady = GetRequiredExperimentWifiReady(_headsetStatus);
         if (_questWifiTransportDiagnostics is { Level: OperationOutcomeKind.Failure } wifiTransport)
         {
             return new WorkflowGuideGateState(
@@ -11328,35 +12669,21 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
                 false);
         }
 
-        if (routedTopologyAccepted)
-        {
-            var routedDetail = _questWifiTransportDiagnostics is { Level: OperationOutcomeKind.Warning } wifiTransportWarning
-                ? $"{HeadsetWifiSummary} {HostWifiSummary} {wifiTransportWarning.Detail}"
-                : $"{HeadsetWifiSummary} {HostWifiSummary} Matching Wi-Fi names are not required here because the current routed host path can already reach the Quest endpoint.";
-            return new WorkflowGuideGateState(
-                _questWifiTransportDiagnostics?.Level == OperationOutcomeKind.Warning
-                    ? OperationOutcomeKind.Warning
-                    : OperationOutcomeKind.Success,
-                "Quest router path is valid.",
-                routedDetail,
-                true);
-        }
-
-        var level = match switch
+        var level = requiredWifiReady switch
         {
             true => OperationOutcomeKind.Success,
             false => OperationOutcomeKind.Failure,
             _ => OperationOutcomeKind.Warning
         };
-        var detail = match switch
+        var detail = requiredWifiReady switch
         {
             true => _questWifiTransportDiagnostics is { Level: OperationOutcomeKind.Warning } wifiTransportWarning
                 ? $"{HeadsetWifiSummary} {HostWifiSummary} {wifiTransportWarning.Detail}"
-                : $"{HeadsetWifiSummary} {HostWifiSummary}",
-            false => $"{HeadsetWifiSummary} {HostWifiSummary} Change the headset Wi-Fi manually inside the headset. Remote Wi-Fi switching is not considered reliable for the experiment path.",
-            _ => "Refresh the headset snapshot until both the headset Wi-Fi and the PC Wi-Fi names are visible. If they differ, change the headset Wi-Fi manually."
+                : $"{HeadsetWifiSummary} {HostWifiSummary} Required Wi-Fi: {RequiredExperimentWifiSsidValue}.",
+            false => $"{HeadsetWifiSummary} {HostWifiSummary} Both the headset and this PC must be connected to Wi-Fi `{RequiredExperimentWifiSsidValue}` before the experiment continues. Remote Wi-Fi switching is not considered reliable for the experiment path.",
+            _ => $"Refresh the headset snapshot until both the headset Wi-Fi and the PC Wi-Fi names are visible. Both must report `{RequiredExperimentWifiSsidValue}` before the experiment continues."
         };
-        return new WorkflowGuideGateState(level, WifiNetworkMatchSummary, detail, match == true);
+        return new WorkflowGuideGateState(level, GetRequiredExperimentWifiSummary(_headsetStatus), detail, requiredWifiReady == true);
     }
 
     private WorkflowGuideGateState BuildUsbDisconnectWorkflowGuideGateState()
@@ -12145,29 +13472,21 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
                 new WorkflowGuideCheckItem(
                     "Headset Wi-Fi",
                     HeadsetWifiSummary,
-                    $"Headset IP {_headsetStatus?.HeadsetWifiIpAddress ?? "n/a"}.",
-                    _questWifiTransportDiagnostics?.RoutedTopologyAccepted == true
-                        ? OperationOutcomeKind.Success
-                        : _headsetStatus?.WifiSsidMatchesHost == true
+                    $"Required SSID {RequiredExperimentWifiSsidValue}. Headset IP {_headsetStatus?.HeadsetWifiIpAddress ?? "n/a"}.",
+                    string.IsNullOrWhiteSpace(_headsetStatus?.HeadsetWifiSsid)
+                        ? OperationOutcomeKind.Warning
+                        : IsRequiredExperimentWifiSsid(_headsetStatus.HeadsetWifiSsid)
                             ? OperationOutcomeKind.Success
-                            : _headsetStatus?.WifiSsidMatchesHost == false
-                                ? OperationOutcomeKind.Failure
-                                : OperationOutcomeKind.Warning),
+                            : OperationOutcomeKind.Failure),
                 new WorkflowGuideCheckItem(
                     "PC network",
                     HostWifiSummary,
-                    _questWifiTransportDiagnostics?.RoutedTopologyAccepted == true
-                        ? "The current routed host path can already reach the Quest endpoint, so matching PC Wi-Fi names are not required on this topology."
-                        : string.IsNullOrWhiteSpace(_headsetStatus?.HostWifiSsid)
-                            ? "If this PC is on Ethernet, that is still valid as long as the router-path check turns green. If you expect PC Wi-Fi here, refresh the snapshot until the Windows-side probe returns it."
-                            : "If the names differ and the router-path check stays red, move the headset onto the same reachable router path before continuing.",
-                    _questWifiTransportDiagnostics?.RoutedTopologyAccepted == true
-                        ? OperationOutcomeKind.Success
-                        : _headsetStatus?.WifiSsidMatchesHost == true
+                    $"The experiment PC must also report Wi-Fi {RequiredExperimentWifiSsidValue}; Ethernet or another routed path is not accepted for this experiment runner.",
+                    string.IsNullOrWhiteSpace(_headsetStatus?.HostWifiSsid)
+                        ? OperationOutcomeKind.Warning
+                        : IsRequiredExperimentWifiSsid(_headsetStatus.HostWifiSsid)
                             ? OperationOutcomeKind.Success
-                            : _headsetStatus?.WifiSsidMatchesHost == false
-                                ? OperationOutcomeKind.Failure
-                                : OperationOutcomeKind.Warning),
+                            : OperationOutcomeKind.Failure),
                 BuildWifiTransportWorkflowGuideCheckItem()
             ],
             3 =>
@@ -12272,8 +13591,24 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
             ],
             2 =>
             [
-                new WorkflowGuideCheckItem("Headset Wi-Fi", HeadsetWifiSummary, $"Headset IP {_headsetStatus?.HeadsetWifiIpAddress ?? "n/a"}.", _headsetStatus?.WifiSsidMatchesHost == true || _questWifiTransportDiagnostics?.RoutedTopologyAccepted == true ? OperationOutcomeKind.Success : OperationOutcomeKind.Warning),
-                new WorkflowGuideCheckItem("PC network", HostWifiSummary, "The PC must be able to reach the active Quest ADB endpoint before the operator workflow starts.", _questWifiTransportDiagnostics?.RoutedTopologyAccepted == true ? OperationOutcomeKind.Success : OperationOutcomeKind.Preview),
+                new WorkflowGuideCheckItem(
+                    "Headset Wi-Fi",
+                    HeadsetWifiSummary,
+                    $"Required SSID {RequiredExperimentWifiSsidValue}. Headset IP {_headsetStatus?.HeadsetWifiIpAddress ?? "n/a"}.",
+                    string.IsNullOrWhiteSpace(_headsetStatus?.HeadsetWifiSsid)
+                        ? OperationOutcomeKind.Warning
+                        : IsRequiredExperimentWifiSsid(_headsetStatus.HeadsetWifiSsid)
+                            ? OperationOutcomeKind.Success
+                            : OperationOutcomeKind.Failure),
+                new WorkflowGuideCheckItem(
+                    "PC network",
+                    HostWifiSummary,
+                    $"The experiment PC must also report Wi-Fi {RequiredExperimentWifiSsidValue}; Ethernet or another routed path is not accepted for this experiment runner.",
+                    string.IsNullOrWhiteSpace(_headsetStatus?.HostWifiSsid)
+                        ? OperationOutcomeKind.Warning
+                        : IsRequiredExperimentWifiSsid(_headsetStatus.HostWifiSsid)
+                            ? OperationOutcomeKind.Success
+                            : OperationOutcomeKind.Failure),
                 BuildWifiTransportWorkflowGuideCheckItem()
             ],
             3 =>
@@ -12295,7 +13630,7 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
             6 =>
             [
                 new WorkflowGuideCheckItem("Block 1 panel", LastActionSucceeded("Open Questionnaire 1") ? "Block 1 launch command completed." : "Block 1 has not been opened from this guide yet.", "Open the MAIA spatial questionnaire Block 1 from the operator command path.", LastActionSucceeded("Open Questionnaire 1") ? OperationOutcomeKind.Success : OperationOutcomeKind.Preview),
-                new WorkflowGuideCheckItem("Block 1 submit gate", PeripersonalQuestionnaireBlockOneSubmitted ? "Block 1 is marked submitted." : "Block 1 is not marked submitted yet.", "After participant submit, mark Block 1 submitted so global recording can start.", PeripersonalQuestionnaireBlockOneSubmitted ? OperationOutcomeKind.Success : OperationOutcomeKind.Warning)
+                new WorkflowGuideCheckItem("Block 1 completion", PeripersonalQuestionnaireBlockOneSubmitted ? "Block 1 is marked submitted." : "Block 1 is not marked submitted yet.", "Block 1 completion is logged inside the experiment recording; it is not required before recording starts.", PeripersonalQuestionnaireBlockOneSubmitted ? OperationOutcomeKind.Success : OperationOutcomeKind.Preview)
             ],
             7 =>
             [
@@ -12960,7 +14295,7 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
 
         var headsetConnected = _headsetStatus?.IsConnected == true;
         var wifiReady = _headsetStatus?.IsWifiAdbTransport == true;
-        var wifiMatchReady = _headsetStatus?.WifiSsidMatchesHost == true;
+        var wifiMatchReady = IsRequiredExperimentWifiReady();
         var buildReady = PinnedBuildLevel == OperationOutcomeKind.Success;
         var profileReady = DeviceProfileLevel == OperationOutcomeKind.Success;
         var runtimeForeground = IsStudyRuntimeForeground();
@@ -12982,7 +14317,7 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
         if (_isPeripersonalWorkflow)
         {
             UpdatePeripersonalWorkflowStatus(
-                setupReady: headsetConnected && wifiReady && buildReady,
+                setupReady: headsetConnected && wifiReady && wifiMatchReady && buildReady,
                 runtimeForeground);
             return;
         }
@@ -13005,13 +14340,13 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
                 : !wifiReady
                     ? "Enable or restore Wi-Fi ADB before starting the stable Sussex flow."
                     : !wifiMatchReady
-                        ? "Match the headset Wi-Fi to this PC before starting the stable Sussex flow."
+                        ? $"Connect both the headset and this PC to Wi-Fi {RequiredExperimentWifiSsidValue} before starting the stable Sussex flow."
                     : PinnedBuildLevel == OperationOutcomeKind.Failure
                         ? "Pinned Sussex build still needs attention."
                         : "Headset setup is still incomplete.";
         WorkflowSetupDetail =
             $"{ConnectionTransportSummary} {WifiNetworkMatchSummary} {PinnedBuildSummary} {DeviceProfileSummary} {HeadsetBatteryLabel}. {HeadsetSoftwareVersionLabel}. " +
-            "Brightness, battery, and software-identity readouts stay visible as bench context, but the Sussex setup path only blocks on APK readiness, Wi-Fi ADB, and Wi-Fi match. LSL remains the required bench check before participant handoff.";
+            $"Brightness, battery, and software-identity readouts stay visible as bench context, but the Sussex setup path only blocks on APK readiness, Wi-Fi ADB, and the required {RequiredExperimentWifiSsidValue} Wi-Fi network. LSL remains the required bench check before participant handoff.";
 
         WorkflowKioskLevel = !setupReady
             ? OperationOutcomeKind.Preview
@@ -13211,20 +14546,11 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
             return;
         }
 
-        if (!PeripersonalQuestionnaireBlockOneSubmitted)
-        {
-            WorkflowCurrentStepLevel = OperationOutcomeKind.Warning;
-            WorkflowCurrentStepSummary = "4. Run Questionnaire Block 1 before recording.";
-            WorkflowCurrentStepDetail = "Open Block 1, let the participant submit in the panel app, then mark Block 1 submitted in the operator workflow.";
-            UpdateWorkflowGuideState();
-            return;
-        }
-
         if (_peripersonalWorkflow.State == PeripersonalOperatorWorkflowState.Prepared)
         {
-            WorkflowCurrentStepLevel = OperationOutcomeKind.Warning;
-            WorkflowCurrentStepSummary = "5. Start the one global recording.";
-            WorkflowCurrentStepDetail = "Start Recording happens once after Block 1, then the remaining questionnaire and XR blocks run inside that same recording.";
+            WorkflowCurrentStepLevel = OperationOutcomeKind.Preview;
+            WorkflowCurrentStepSummary = "4. Start the experiment recording.";
+            WorkflowCurrentStepDetail = "Recording can start as soon as the participant metadata/session preparation is complete. Block 1 then runs inside the active recording.";
             UpdateWorkflowGuideState();
             return;
         }
@@ -14277,6 +15603,12 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
 
     private void UpdateParticlesCard()
     {
+        if (_isPeripersonalWorkflow)
+        {
+            UpdatePeripersonalParticlesCard();
+            return;
+        }
+
         var visibility = ParseBool(GetFirstValue(_study.Monitoring.ParticleVisibilityKeys));
         var requestedVisible = ParseBool(GetFirstValue("study.particles.requested_visible"));
         var renderOutputEnabled = ParseBool(GetFirstValue("study.particles.render_output_enabled"));
@@ -14346,6 +15678,52 @@ public sealed partial class StudyShellViewModel : ObservableObject, IDisposable
                         : "Particle visibility is partially reported.";
         ParticlesDetail = $"{commandDetail} {BuildTwinCommandTransportDetail()} {BuildParticleVisibilityEffectDetail(inferredEffect)} {BuildParticleRuntimeDetail(requestedVisible, actualVisible, renderOutputEnabled, suppressedByOperator, suppressedByHud)}".Trim();
     }
+
+    private void UpdatePeripersonalParticlesCard()
+    {
+        if (!_isPeripersonalWorkflow)
+        {
+            return;
+        }
+
+        if (_peripersonalPendingParticlesVisible.HasValue)
+        {
+            var pendingLabel = _peripersonalPendingParticlesVisible.Value ? "Particles On" : "Particles Off";
+            var pendingValue = _peripersonalPendingParticlesVisible.Value ? "true" : "false";
+            ParticlesLevel = OperationOutcomeKind.Warning;
+            ParticlesSummary = $"Waiting for headset confirmation: {pendingLabel}.";
+            ParticlesDetail = $"{FormatPeripersonalParticleStateDetail()} The switch stays in the last confirmed position until Unity reports particles_visible={pendingValue}.";
+            return;
+        }
+
+        if (!_peripersonalParticlesVisible.HasValue
+            && _peripersonalWorkflow?.State != PeripersonalOperatorWorkflowState.Recording)
+        {
+            ParticlesLevel = OperationOutcomeKind.Preview;
+            ParticlesSummary = "Particles start hidden when the experiment recording begins.";
+            ParticlesDetail = "Start Experiment prepares metadata, starts the global recording, forces particles off, and opens Block 1.";
+            return;
+        }
+
+        if (!_peripersonalParticlesVisible.HasValue)
+        {
+            ParticlesLevel = OperationOutcomeKind.Warning;
+            ParticlesSummary = "Waiting for runtime particle state.";
+            ParticlesDetail = "The runner is listening for the peripersonal runtime-state stream, command receipt, or Unity HTTP status bridge to confirm the particle state.";
+            return;
+        }
+
+        ParticlesLevel = OperationOutcomeKind.Success;
+        ParticlesSummary = _peripersonalParticlesVisible.Value
+            ? "Particles are visible."
+            : "Particles are hidden.";
+        ParticlesDetail = "Confirmed by the peripersonal command receipt, runtime-state stream, or Unity HTTP status bridge.";
+    }
+
+    private string FormatPeripersonalParticleStateDetail()
+        => _peripersonalParticlesVisible.HasValue
+            ? $"Last confirmed state: {(_peripersonalParticlesVisible.Value ? "visible" : "hidden")}."
+            : "No confirmed particle state has arrived yet.";
 
     private void UpdateProximityCard()
     {

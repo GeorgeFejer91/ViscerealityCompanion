@@ -196,15 +196,71 @@ public sealed class StudyExperimentSessionWindowTests
         });
     }
 
+    [Fact]
+    public void PeripersonalSessionPreparationState_SavesReadableJson()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"peripersonal-prep-{Guid.NewGuid():N}");
+        var path = Path.Combine(root, "session-preparation.json");
+        try
+        {
+            var saved = PeripersonalSessionPreparationState.Create(
+                "peripersonal-space",
+                "P001",
+                "Participant Example",
+                "27",
+                "session-001",
+                "right-handed",
+                "en",
+                "left-visible");
+
+            saved.Save(path);
+            var loaded = Assert.IsType<PeripersonalSessionPreparationState>(
+                PeripersonalSessionPreparationState.Load(path));
+            var json = File.ReadAllText(path);
+
+            Assert.Equal("Participant Example", loaded.ParticipantName);
+            Assert.Equal("P001", loaded.ParticipantNumber);
+            Assert.Equal("27", loaded.Age);
+            Assert.Equal("session-001", loaded.SessionId);
+            Assert.Equal("right-handed", loaded.Handedness);
+            Assert.Equal("en", loaded.LanguageCode);
+            Assert.Equal("left-visible", loaded.InitialConditionId);
+            Assert.Contains("\"participantName\": \"Participant Example\"", json);
+            Assert.Contains("\"participantNumber\": \"P001\"", json);
+            Assert.Contains("\"age\": \"27\"", json);
+
+            var ledgerPath = Path.Combine(root, "participant-ledger.jsonl");
+            PeripersonalParticipantLedger.Append(saved, ledgerPath);
+            var ledgerEntry = Assert.IsType<PeripersonalParticipantLedgerEntry>(
+                PeripersonalParticipantLedger.FindLatest("P001", "peripersonal-space", ledgerPath));
+
+            Assert.Equal("P001", ledgerEntry.ParticipantNumber);
+            Assert.Equal("Participant Example", ledgerEntry.ParticipantName);
+            Assert.Equal("27", ledgerEntry.Age);
+            Assert.Single(PeripersonalParticipantLedger.Load(ledgerPath));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
     private static StudyShellDefinition CreateStudy(string? studyId = null)
-        => new(
-            studyId ?? "sussex-experiment-session-test",
-            "Sussex Test",
-            "Sussex",
-            "Experiment session window regression test.",
+    {
+        var id = studyId ?? "sussex-experiment-session-test";
+        var isPeripersonal = string.Equals(id, "peripersonal-space", StringComparison.OrdinalIgnoreCase);
+
+        return new StudyShellDefinition(
+            id,
+            isPeripersonal ? "Peripersonal Space" : "Sussex Test",
+            isPeripersonal ? "Peripersonal study team" : "Sussex",
+            isPeripersonal ? "Peripersonal experiment session window regression test." : "Experiment session window regression test.",
             new StudyPinnedApp(
-                "Sussex",
-                "com.Viscereality.SussexExperiment",
+                isPeripersonal ? "Peripersonal" : "Sussex",
+                isPeripersonal ? "com.Viscereality.ViscerealityPeriPersonal" : "com.Viscereality.SussexExperiment",
                 string.Empty,
                 string.Empty,
                 string.Empty,
@@ -250,6 +306,11 @@ public sealed class StudyExperimentSessionWindowTests
                 ResetBreathingCalibrationActionId: "calibration.reset",
                 StartExperimentActionId: "experiment.start",
                 EndExperimentActionId: "experiment.end"),
+            isPeripersonal ? CreatePeripersonalConditions() : CreateSussexConditions());
+    }
+
+    private static IReadOnlyList<StudyConditionDefinition> CreateSussexConditions()
+        =>
             [
                 new StudyConditionDefinition(
                     "current",
@@ -270,7 +331,36 @@ public sealed class StudyExperimentSessionWindowTests
                     "condition-current-visual",
                     "condition-current-breathing",
                     isActive: false)
-            ]);
+            ];
+
+    private static IReadOnlyList<StudyConditionDefinition> CreatePeripersonalConditions()
+        =>
+            [
+                new StudyConditionDefinition(
+                    "left-visible",
+                    "Left Visible",
+                    "Left-hand peripersonal XR block with particles visible.",
+                    "peripersonal-left-visible",
+                    "peripersonal-runtime-default",
+                    properties: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        ["activeHand"] = "left",
+                        ["particlesVisible"] = "true",
+                        ["visibilityMode"] = "particles_visible"
+                    }),
+                new StudyConditionDefinition(
+                    "left-anchor-only",
+                    "Left Anchor Only",
+                    "Left-hand peripersonal XR block with default particles hidden and anchor indicator retained.",
+                    "peripersonal-left-anchor-only",
+                    "peripersonal-runtime-default",
+                    properties: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        ["activeHand"] = "left",
+                        ["particlesVisible"] = "false",
+                        ["visibilityMode"] = "anchor_only"
+                    })
+            ];
 
     private static async Task WaitForConditionAsync(Func<bool> condition, TimeSpan timeout)
     {

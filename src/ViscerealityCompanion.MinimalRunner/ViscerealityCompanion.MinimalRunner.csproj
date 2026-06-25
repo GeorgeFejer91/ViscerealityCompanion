@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\ViscerealityCompanion.App\ViscerealityCompanion.App.csproj" />
+    <ProjectReference Include="..\ViscerealityCompanion.Core\ViscerealityCompanion.Core.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>ViscerealityMinimalRunner</AssemblyName>
+    <RootNamespace>ViscerealityCompanion.MinimalRunner</RootNamespace>
+    <Title>Viscereality Minimal Runner</Title>
+    <Product>Viscereality Minimal Runner</Product>
+    <ApplicationIcon>Assets\viscereality-companion-inverted.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\samples\study-shells\**\*.*"
+          Link="samples\study-shells\%(RecursiveDir)%(Filename)%(Extension)"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="..\..\samples\quest-session-kit\**\*.*"
+          Link="samples\quest-session-kit\%(RecursiveDir)%(Filename)%(Extension)"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="..\ViscerealityCompanion.App\runtimes\win-x64\native\lsl.dll"
+          Link="runtimes\win-x64\native\lsl.dll"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\viscereality-companion-inverted.ico" />
+    <Resource Include="Assets\viscereality-wordmark-inverted.png" />
+  </ItemGroup>
+
+</Project>

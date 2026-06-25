@@ -53,7 +53,7 @@ public sealed class PeripersonalLslCommandTransport : IPeripersonalCommandTransp
     {
         _commandOutlet = commandOutlet ?? throw new ArgumentNullException(nameof(commandOutlet));
         _ackMonitor = ackMonitor ?? throw new ArgumentNullException(nameof(ackMonitor));
-        _receiptTimeout = receiptTimeout ?? TimeSpan.FromSeconds(5);
+        _receiptTimeout = receiptTimeout ?? TimeSpan.FromSeconds(25);
     }
 
     public async Task<PeripersonalCommandReceiptEnvelope> SendAsync(
