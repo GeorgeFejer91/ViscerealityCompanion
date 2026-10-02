@@ -536,3 +536,7 @@ unless the user explicitly asks for asymmetric behavior.
 - `$uncodixfy-ui` is available and should be used for layout, styling, and UI
   polish work so the WPF shell stays restrained and product-specific instead of
   drifting toward generic dashboard chrome.
+
+## Quest ADB Access
+
+For local headset work, use the configured ADB wrapper and authorize the headset from its UI. Do not commit device serials, key locations, or workstation-specific paths.
